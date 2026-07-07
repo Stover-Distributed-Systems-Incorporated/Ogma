@@ -1741,10 +1741,33 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         guard isSTTInstalled else {
             setDictationState(.idle)
             NSApp.activate(ignoringOtherApps: true)
+            guard isAppleSilicon else {
+                let a = NSAlert()
+                a.messageText = "Dictation Not Available"
+                a.informativeText = "Local dictation requires an Apple Silicon Mac (M1 or later)."
+                a.runModal()
+                return
+            }
             let a = NSAlert()
-            a.messageText = "Dictation not installed"
-            a.informativeText = "Local dictation needs the Ogma local engine (Apple Silicon). Install it from the menu, then try ⌥⇧D again."
-            a.runModal()
+            a.messageText = "Set Up Dictation?"
+            a.informativeText = "Dictation runs entirely on your Mac using the Parakeet speech model — your voice never leaves the machine. The local speech models (~3 GB) download in the background; you'll be notified when dictation is ready."
+            a.addButton(withTitle: "Install")
+            a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn {
+                runInstallLocal(desiredBackend: config.ttsBackend) { ok in
+                    NSApp.activate(ignoringOtherApps: true)
+                    let done = NSAlert()
+                    if ok {
+                        done.messageText = "Dictation Ready"
+                        done.informativeText = "Press ⌥⇧D and start talking."
+                    } else {
+                        done.messageText = "Installation Failed"
+                        done.informativeText = "Could not install the dictation engine.\n\nAn internet connection is required for the first install."
+                        done.alertStyle = .warning
+                    }
+                    done.runModal()
+                }
+            }
             return
         }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -2584,8 +2607,8 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Install Local TTS"
-        alert.informativeText = "This will install mlx-audio and download the Kokoro voice model (~350 MB)."
+        alert.messageText = "Install Local Speech Engine"
+        alert.informativeText = "This will install the on-device speech models — Kokoro for reading aloud and Parakeet for dictation (~3 GB total)."
         alert.addButton(withTitle: "Install")
         alert.addButton(withTitle: skipLabel)
         return alert.runModal() == .alertFirstButtonReturn
@@ -2623,8 +2646,8 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         if success {
-            a.messageText = "Local TTS Installed"
-            a.informativeText = "mlx-audio and the Kokoro model are ready."
+            a.messageText = "Local Speech Engine Installed"
+            a.informativeText = "Read-aloud (Kokoro) and dictation (Parakeet) are ready.\n\n⌥⇧/ speaks your selection · ⌥⇧D types what you say."
         } else {
             a.messageText = "Installation Failed"
             a.informativeText = "Could not install local TTS.\n\nAn internet connection is required for the first install.\nPlease check your connection and try again."
@@ -2691,25 +2714,41 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         var backend = "elevenlabs"          // Intel: cloud only
+        var installLocalModels = false
+
         if isAppleSilicon {
-            let alert = NSAlert()
-            alert.messageText = "Welcome to Ogma"
-            alert.informativeText = """
+            let welcome = NSAlert()
+            welcome.messageText = "Welcome to Ogma"
+            welcome.informativeText = """
                 ⌥⇧/ reads your selected text aloud. ⌥⇧D types what you say.
 
-                Choose your text-to-speech backend — you can change it anytime from the menu bar:
+                Install Everything sets Ogma up completely: the on-device speech models — Kokoro for reading aloud, Parakeet for dictation — download in the background (~3 GB), and you can add a free ElevenLabs key for cloud voices too.
 
-                • Both — ElevenLabs cloud with free local fallback
-                • ElevenLabs Only — cloud voices (needs a free API key)
-                • Local Only — free and private, runs entirely on your Mac
+                Customize picks the pieces yourself.
                 """
-            alert.addButton(withTitle: "Both")
-            alert.addButton(withTitle: "ElevenLabs Only")
-            alert.addButton(withTitle: "Local Only")
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:  backend = "auto"
-            case .alertSecondButtonReturn: backend = "elevenlabs"
-            default:                       backend = "local"
+            welcome.addButton(withTitle: "Install Everything")
+            welcome.addButton(withTitle: "Customize…")
+            if welcome.runModal() == .alertFirstButtonReturn {
+                backend = "auto"
+                installLocalModels = true
+            } else {
+                let alert = NSAlert()
+                alert.messageText = "Choose Your Setup"
+                alert.informativeText = """
+                    Pick a text-to-speech backend — you can change it anytime from the menu bar:
+
+                    • Both — ElevenLabs cloud with free local fallback
+                    • ElevenLabs Only — cloud voices (needs a free API key)
+                    • Local Only — free and private, runs entirely on your Mac
+                    """
+                alert.addButton(withTitle: "Both")
+                alert.addButton(withTitle: "ElevenLabs Only")
+                alert.addButton(withTitle: "Local Only")
+                switch alert.runModal() {
+                case .alertFirstButtonReturn:  backend = "auto";  installLocalModels = true
+                case .alertSecondButtonReturn: backend = "elevenlabs"
+                default:                       backend = "local"; installLocalModels = true
+                }
             }
         } else {
             let alert = NSAlert()
@@ -2726,6 +2765,16 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
                 showNote("No API Key Set",
                          "You can add one anytime via the menu bar icon → API Key…")
             }
+            // Dictation is independent of the TTS backend — cloud-voice users
+            // can still have on-device speech-to-text (Apple Silicon).
+            if isAppleSilicon {
+                let a = NSAlert()
+                a.messageText = "Install Dictation?"
+                a.informativeText = "⌥⇧D types what you say using the on-device Parakeet engine — your voice never leaves your Mac. The local speech models (~3 GB) download in the background."
+                a.addButton(withTitle: "Install")
+                a.addButton(withTitle: "Skip")
+                installLocalModels = a.runModal() == .alertFirstButtonReturn
+            }
         }
 
         config = Config.load()              // defaults — no file exists yet
@@ -2734,9 +2783,10 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         config.save()
         rebuildMenu()
 
-        if backend != "elevenlabs" && isAppleSilicon {
+        if installLocalModels && isAppleSilicon {
             showNote("Installing Local Speech Models",
-                     "mlx-audio and the Kokoro voice model (~350 MB) are downloading in the background.\n\nYou'll be notified when local TTS is ready.")
+                     "The Kokoro (read-aloud) and Parakeet (dictation) models are downloading in the background (~3 GB).\n\nYou'll be notified when they're ready"
+                     + (backend == "local" ? "." : " — cloud features work immediately."))
             runInstallLocal(desiredBackend: backend) { [weak self] ok in
                 self?.showInstallResult(success: ok)
                 self?.updateTTSDaemon()

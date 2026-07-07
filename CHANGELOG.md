@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.1.0
+
+### Highlights
+
+**One-click setup.** First launch now opens with **Install Everything** — one click configures cloud voices and downloads the on-device speech models (Kokoro for reading aloud, Parakeet for dictation, ~3 GB) in the background. **Customize…** keeps the old pick-your-backend flow for people who want to choose the pieces themselves.
+
+### Improvements
+
+- **Dictation for cloud users**: choosing *ElevenLabs Only* now offers to install the local dictation engine too — speech-to-text is independent of which voices you listen with
+- **No more dead ends**: pressing `⌥⇧D` before the dictation engine is installed now offers to install it on the spot, instead of pointing you at the menu
+- **Honest download sizes**: install dialogs now say ~3 GB (Kokoro + Parakeet + dependencies) instead of quoting only the 350 MB Kokoro model
+
 ## v2.0.0
 
 ### Highlights

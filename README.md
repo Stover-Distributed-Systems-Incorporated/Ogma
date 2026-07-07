@@ -48,9 +48,9 @@ Ogma is a **fork of [Speak11](https://speakeleven.com)** — Speak11 remains its
    - **macOS 15 (Sequoia) and later:** open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to the Ogma message, then confirm
    - **macOS 13–14:** Control-click `Ogma.pkg` → **Open** → **Open**
 3. Click through the installer — Ogma launches automatically when it finishes
-4. On first launch, choose your backend: **Both** (recommended), **ElevenLabs Only**, or **Local Only** (Apple Silicon only), and paste your API key if prompted
+4. On first launch, click **Install Everything** (recommended): the on-device speech models — Kokoro for reading aloud, Parakeet for dictation — download in the background (~3 GB, Apple Silicon), and you can add a free ElevenLabs key for cloud voices. Prefer to pick the pieces yourself? Click **Customize…** instead and choose exactly which backend and models get installed.
 
-The app is a prebuilt universal binary (Apple Silicon + Intel) — no developer tools needed. Choosing **Both** or **Local Only** on Apple Silicon downloads mlx-audio + Kokoro in the background for free offline TTS.
+The app is a prebuilt universal binary (Apple Silicon + Intel) — no developer tools needed. Everything keeps working while the models download; you're notified when they're ready.
 
 > **Getting your API key:** sign in at [elevenlabs.io](https://elevenlabs.io) → click your profile icon → **Profile + API Key** → create or copy a key. The key needs the **Text-to-Speech** and **User Read** permissions enabled (User Read lets the menu bar show your remaining credits).
 
@@ -163,7 +163,7 @@ Double-click **`uninstall.command`** — it removes everything including the Acc
 | Symptom | Fix |
 |---------|-----|
 | `⌥⇧/` does nothing | Grant Accessibility permission when prompted, or check System Settings → Privacy & Security → Accessibility. The app re-checks every few seconds and recovers automatically once permission is granted |
-| `⌥⇧D` does nothing | Same Accessibility check as above, plus Microphone permission (System Settings → Privacy & Security → Microphone). Dictation needs the local engine installed (Apple Silicon) |
+| `⌥⇧D` does nothing | Same Accessibility check as above, plus Microphone permission (System Settings → Privacy & Security → Microphone). If the local engine isn't installed yet, pressing `⌥⇧D` offers to install it (Apple Silicon) |
 | Waveform icon not in menu bar | Open `/Applications/Ogma.app` (pkg installs) or `~/Applications/Ogma.app` (source installs) manually |
 | HTTP 401 | API key is wrong or expired — update it via the menu bar icon → **API Key…** |
 | HTTP 429 | Monthly character quota exceeded — if both backends are installed, the app automatically falls back to local TTS. On Apple Silicon with ElevenLabs only, it will offer to install local TTS as a free alternative |
