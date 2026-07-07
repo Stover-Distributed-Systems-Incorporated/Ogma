@@ -1,0 +1,95 @@
+# Changelog
+
+## v2.0.0
+
+### Highlights
+
+**Native installer package.** Ogma now ships as a standard macOS `.pkg` — download, double-click, done. The app arrives prebuilt as a universal binary (Apple Silicon + Intel, macOS 13+), so **Xcode Command Line Tools are no longer required**. First-run setup moved from the installer script into the app itself: choose your backend, paste your API key, and the local models download in the background — all from the menu bar app. The helper scripts install themselves into `~/.local/bin` on first launch and re-sync automatically after every update. `install.command` still works for source installs.
+
+**Ogma** — a fork of [Speak11](https://speakeleven.com), named for the Celtic god of eloquence who invented the Ogham script: the deity of both speech and writing, which is exactly what this app does. The icon is the name "OGMA" written in real Ogham strokes on a stemline, carved cream-on-green. Same public-domain license (Unlicense) as the upstream project. Everything below the fork point — the review card, word confidence, autocorrect, stabilized live transcripts — is Ogma.
+
+**Local dictation with an interactive review card.** Press `⌥⇧D` and talk — a floating caption shows the live transcript, wrapping and growing vertically as you speak (Parakeet STT via parakeet-mlx, fully local, Apple Silicon). Press `⌥⇧D` again and the caption becomes a review card: **✓ Insert** (`Return`) pastes at your cursor, clicking the text lets you edit it first (typed edits render gray), **✗ Discard** (`Esc`) throws it away, and `⌥⇧D` dictates *more* into the transcript at the caret. A "Review before insert" menu toggle restores the old paste-immediately behavior.
+
+**Word-level confidence display.** The STT daemon reports per-word confidence derived from Parakeet's token scores. Words the model wasn't sure about are tinted yellow (uncertain) or red + underlined (probably wrong) in both the live caption and the review card. Clicking a flagged word pops a tiny ✓/✕ chip to keep or cut it, with a gray explainer line at the bottom of the card. Thresholds calibrated against live model output (correct words on clean audio score ≥0.96; misrecognitions ~0.79–0.87; noise hallucinations <0.55).
+
+### New features
+
+- **Dictation** (`stt_server.py` + `Ogma.swift`): push-to-talk speech-to-text with a warm-model daemon (Unix socket, idle auto-unload, menu-bar load/unload toggle + countdown, `STT_IDLE_TIMEOUT` config), live streaming captions, and paste-at-cursor
+- **Review card**: non-activating floating panel that can take keyboard focus without stealing your app's frontmost status (Spotlight-style); grows with the transcript and scrolls past 40% of screen height; won't grab the keyboard if you've typed since stopping — click it to arm
+- **Word confidence protocol**: daemon partials/finals/one-shot responses carry `words: [{text, confidence}]`; the word list is derived from the transcript text itself so the display always matches what gets inserted; older app/daemon combinations keep working
+- **Insert that can't lose your words**: the paste verifies a focused UI element in the frontmost app (via Accessibility), detects secure-input (password) fields, and re-activates the original target if needed — and when no safe paste target exists, the transcript is copied to the clipboard with an on-screen notice instead of being dropped
+- **Personal dictionary**: names and jargon you list are offered as one-click ↻ replacements when dictation mishears them (phonetic matching: "Zantipi" finds `Xanthippe`), are never autocorrected away, and reload live on every edit — editable from the menu bar (**Dictionary…**) or directly at `~/.config/ogma/dictionary.txt`
+- **Filler words removed**: *um, uh, er, hmm…* never make it into the transcript — filtered live from the very first partial, with capitalization and punctuation repaired at each removal point. `FILTER_FILLERS="false"` in the config keeps them
+- **Context autocorrect for shaky words**: an old-school n-gram + phonetics engine (Norvig word/bigram counts + metaphone matching, ~10 MB, no LLM) checks each low-confidence word against its sentence context; when a phonetically similar word fits far better, the word's ✓/✕ chip gains a one-click "↻ replacement" button. Suggest-only — it never rewrites anything by itself, and unknown proper nouns are left alone
+- **Speak the card**: select text in the review card and press `⌥⇧/` to hear it read aloud
+- **Hotkey auto-recovery**: the app re-arms its global hotkeys automatically after Accessibility permission is toggled or the event tap dies — no relaunch needed
+- **Test isolation**: `OGMA_DATA_DIR` runs an isolated STT daemon (own socket, lock, and config) for the new live end-to-end streaming test
+
+### Bug fixes
+
+- The dictation card no longer vanishes mid-recording when you switch apps while Ogma is the active app (e.g. after starting dictation from the menu bar): panels hide on app-deactivate by default, so the mic stayed hot with nothing on screen
+- Live transcripts are stabilized (local-agreement): a word is committed once two consecutive decodes agree on it and is never rewritten on screen afterwards — only the last couple of words keep revising while you talk
+- Clipboard restore after paste is guarded by a pasteboard change count and waits 1s, so a busy target app pastes the transcript rather than the restored old clipboard, and a copy made meanwhile is never clobbered
+- Stale dictation sessions (slow daemon, abandoned recordings) can no longer hijack or tear down a newer session: finals are matched to their session, the teardown fallback is generation-guarded, and orphaned socket clients close instead of wedging the single-flight daemon
+- Held-down hotkeys no longer thrash start/stop (key autorepeats are consumed)
+- A second `⌥⇧D` during the microphone-permission prompt can no longer double-start recording
+
+## v1.1.0
+
+### Highlights
+
+**Gapless playback.** A native Swift audio queue player replaces per-sentence `afplay` calls, cutting the gap between sentences from ~970ms to ~30ms. A configurable pause (default 400ms at 1× speed) restores natural speech rhythm and scales automatically with your speed setting. Adjustable from the menu bar -- click "Sentence Pause" and type any value in milliseconds.
+
+**Text normalizer.** A new 6-phase Python preprocessor turns PDFs, LaTeX, and Markdown into clean, speakable text. It combines general-purpose normalization (currency, abbreviations, Unicode cleanup) with domain-specific handling for technical and scientific content (LaTeX math, SI units, Greek letters). Separate front-ends for PDF, LaTeX, and Markdown input clean up format-specific artifacts before the text reaches the TTS engine.
+
+### New features
+
+- **Audio queue player** (`ogma-audio.swift`): gapless sentence playback via `AVAudioPlayer` queue with `CoreAudio` mute detection, replacing the old afplay-per-sentence approach
+- **Sentence pause**: configurable inter-sentence silence (0--1000+ ms) that scales inversely with playback speed; free-form input from the menu bar
+- **Text normalizer** (`normalize.py`): 1200-line preprocessor with general and domain-specific rules:
+  - *General*: currency (`$1.5M` reads as "1.5 million dollars"), abbreviations (`e.g.`, `i.e.`, `et al.`), math symbols (`±`, `×`, `∞`), Unicode cleanup via ftfy
+  - *Scientific*: LaTeX math environments (`equation`, `align`, `matrix`, `cases`, fractions, superscripts, subscripts), SI units and compound units (`kg/m³`, `kPa`, `nm`, `°C`, `kcal/mol`), Greek letters (`\alpha`, `\beta`, including diacritics and final sigma), Miller crystallographic indices (`(111)`, `[110]`), set theory symbols (`∈`, `⊂`, `∪`)
+  - *PDF front-end*: rejoins mid-word line breaks, strips superscript citations, removes page headers
+  - *LaTeX front-end*: converts math environments, commands, and macros into spoken text
+  - *Markdown front-end*: strips YAML front matter, wikilinks, callout syntax, inline code, HTML tags
+
+### Performance
+
+- Audio queue player eliminates ~970ms inter-sentence overhead (down to ~30ms hardware latency)
+- Test suite runs in ~36s, down from ~2min, with section filtering (`--fast`, `--section`)
+- ftfy is now a required dependency for reliable Unicode normalization
+
+### Bug fixes
+
+- Bare URLs (`go.nature.com/4rzrnyx`) verbalized as "go dot nature dot com slash 4rzrnyx" so local TTS reads dots and slashes correctly
+- PDF mid-word newlines: text copied from PDFs no longer has spurious line breaks inside words and sentences
+- Compound hyphen rejoining across PDF line breaks
+- Superscript citations glued to sentence-ending periods (e.g., `result.²³` now strips cleanly)
+- Nested LaTeX environments (`\begin{equation}\begin{cases}...\end{cases}\end{equation}`)
+- Nested bold/italic in Markdown (`***bold italic***`)
+- `\left\langle` / `\right\rangle` bracket commands
+- Chained equals signs in equations (`a = b = c`)
+- Dollar signs inside math environments (`\$`)
+- Scientific notation (`3\times10^{5}`, negative exponents)
+- `\cfrac` (continuous fractions)
+- Unit slash not triggering false positives on `s/he`
+- Greek final sigma (`ς`) spoken as "sigma"
+- Greek letters with tonos diacritics
+- Star-prefixed lists not breaking italic regex
+- siunitx edge cases and unit joining
+- Denominator singular vs plural (`per mole` not `per moles`)
+- Matrix environments inside equation wrappers
+- `SCRIPT_DIR` ordering bug in speak.sh
+- Terminal no longer minimizes during install/uninstall
+
+### Infrastructure
+
+- Repo-local dev venv for the test suite
+- Always uses the venv Python interpreter, never falls back to system python3
+- `VENV_PYTHON` guards on `split_sentences` and `run_local_tts`
+- Test suite expanded from ~200 to 1066 tests
+- Profiling script (`tests/profile.sh`) for end-to-end pipeline timing
+
+## v1.0.0
+
+Initial release.

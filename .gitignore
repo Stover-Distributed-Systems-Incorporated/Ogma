@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Swift build artifacts
+*.o
+*.swiftmodule
+*.swiftdoc
+*.dSYM/
+.build/
+.swiftpm/
+
+# App bundles and CLI tools (built during install, not tracked)
+*.app
+ogma-audio
+
+# Package build output (build-pkg.sh / release.sh)
+dist/
+
+# Python
+__pycache__/
+.venv/
+
+# IDE
+.vscode/
+.idea/

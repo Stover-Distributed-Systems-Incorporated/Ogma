@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="128" height="128">
+  <!-- Ogma: "OGMA" written in Ogham script (read bottom-to-top) on a
+       stemline — O = 2 level strokes, G = 2 slanted, M = 1 slanted,
+       A = 1 level. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="1024" x2="0" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B3529"/>
+      <stop offset="1" stop-color="#1A5F4B"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="225" fill="url(#bg)"/>
+  <g stroke="#F2EAD3" stroke-linecap="round" fill="none">
+    <path d="M512 164 V860" stroke-width="53"/>
+    <g stroke-width="46">
+      <path d="M338 773 H686"/>
+      <path d="M338 681 H686"/>
+      <path d="M338 614 L686 502"/>
+      <path d="M338 522 L686 410"/>
+      <path d="M338 399 L686 287"/>
+      <path d="M338 230 H686"/>
+    </g>
+  </g>
+</svg>
