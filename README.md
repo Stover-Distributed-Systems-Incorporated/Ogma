@@ -70,7 +70,7 @@ The waveform icon pulses while audio is being generated and played, so you alway
 
 Text copied from PDFs, LaTeX documents, and Markdown files is automatically cleaned up before reading -- math equations, SI units, Greek letters, citations, and formatting artifacts are converted to natural spoken language.
 
-Your API key is stored in your macOS Keychain — never written to a file.
+Your API key is stored in your macOS Keychain — never written to a file. Dictation runs entirely on your machine; nothing you say is uploaded anywhere unless you explicitly opt in to **Share Corrections** (text only, never audio — see Settings below).
 
 ## Settings
 
@@ -114,6 +114,7 @@ Filler words (*um, uh, er, hmm…*) are removed automatically — they never eve
 |---------|---------|
 | **Review before insert** | On (default) — show the review card when dictation stops. Off — paste immediately, as if the card didn't exist. |
 | **Auto-unload after** | How long the speech model stays in memory after the last dictation (default 2 minutes). |
+| **Improve Dictation → Share Corrections** | Off (default). Opt in to send your review-card corrections — the text the model heard, the text you fixed it to, and word confidence scores — so recognition errors can be analyzed and improved. **Audio is never recorded or sent**, uncorrected dictations are never sent, and **View Shared Data…** opens the local log of everything that has been shared. |
 
 ### Playback settings
 
@@ -206,6 +207,7 @@ LOCAL_SPEED="1.00"
 LOCAL_IDLE_TIMEOUT="120"
 STT_IDLE_TIMEOUT="120"
 DICTATION_REVIEW="true"
+SHARE_CORRECTIONS="false"
 SENTENCE_PAUSE="400"
 ```
 

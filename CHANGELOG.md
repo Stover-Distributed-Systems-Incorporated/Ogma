@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.2.0
+
+### Highlights
+
+**Help fix what dictation gets wrong — opt-in.** A new **Improve Dictation → Share Corrections** setting (off by default) sends your review-card corrections to Stover Distributed so recognition errors can be analyzed and fixed. Only text is ever shared: what the model heard, what you corrected it to, per-word confidence scores, and a random anonymous install ID. **Audio is never recorded or sent**, dictations you don't correct are never sent, and everything shared is kept in a local log you can open from the menu (**View Shared Data…**) — the log *is* the disclosure.
+
+### Details
+
+- Consent dialog on opt-in spells out exactly what leaves the machine; **What Gets Shared…** shows it again anytime
+- Corrections queue locally (`~/.local/share/ogma/corrections.jsonl`) and upload in batches with offset tracking — nothing is lost offline, nothing is sent twice
+- `SHARE_CORRECTIONS="false"` in `~/.config/ogma/config` (or the menu toggle) turns it off; the local log stays yours
+
 ## v2.1.0
 
 ### Highlights

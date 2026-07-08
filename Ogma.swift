@@ -36,6 +36,10 @@ struct Config {
     // of pasting the transcript immediately when recording stops.
     var dictationReview: Bool   = true
 
+    // Opt-in: share dictation corrections (text only, never audio) with
+    // Stover Distributed to improve recognition. Default off.
+    var shareCorrections: Bool  = false
+
     // ElevenLabs speed (shared name kept for config compat)
     var speed:           Double = 1.0
 
@@ -73,6 +77,7 @@ struct Config {
             case "LOCAL_IDLE_TIMEOUT":   c.localIdleTimeout   = Int(value) ?? c.localIdleTimeout
             case "STT_IDLE_TIMEOUT":     c.sttIdleTimeout     = Int(value) ?? c.sttIdleTimeout
             case "DICTATION_REVIEW":     c.dictationReview    = value != "false" && value != "0"
+            case "SHARE_CORRECTIONS":    c.shareCorrections   = value == "true" || value == "1"
             case "SENTENCE_PAUSE":       c.sentencePause      = Int(value) ?? c.sentencePause
             default: break
             }
@@ -98,6 +103,7 @@ struct Config {
             "LOCAL_IDLE_TIMEOUT=\"\(localIdleTimeout)\"",
             "STT_IDLE_TIMEOUT=\"\(sttIdleTimeout)\"",
             "DICTATION_REVIEW=\"\(dictationReview ? "true" : "false")\"",
+            "SHARE_CORRECTIONS=\"\(shareCorrections ? "true" : "false")\"",
             "SENTENCE_PAUSE=\"\(sentencePause)\"",
         ]
         try? (lines.joined(separator: "\n") + "\n")
@@ -558,6 +564,11 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     var onInsert: ((String) -> Void)?
     var onDiscard: (() -> Void)?
 
+    // Model output for the current review session, kept pristine while the
+    // user edits the card — the opt-in corrections log diffs against this.
+    private(set) var reviewOriginalText = ""
+    private(set) var reviewOriginalWords: [STTWord] = []
+
     // MARK: Live dictation — the card IS the recording view
 
     // ⌥⇧D from idle: show the card immediately, with partials streaming into
@@ -634,6 +645,8 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             panel.allowsKey = true
             panel.ignoresMouseEvents = false
             panel.makeFirstResponder(nil)   // text view starts unfocused
+            self.reviewOriginalText = text
+            self.reviewOriginalWords = words
             self.setTranscript(text, words: words)
             if takeKey {
                 panel.makeKeyAndOrderFront(nil)
@@ -750,6 +763,9 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             let repl = self.attributed(text, words: words)
             tv.textStorage?.replaceCharacters(in: range, with: repl)
             tv.setSelectedRange(NSRange(location: range.location + repl.length, length: 0))
+            // Dictate-more extends the model output this session diffs against.
+            self.reviewOriginalText += (self.reviewOriginalText.isEmpty ? "" : " ") + text
+            self.reviewOriginalWords += words
             self.endCardDictation()
             self.relayout()
         }
@@ -1233,6 +1249,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         }
         updateTTSDaemon()
         fetchCredits()
+        if config.shareCorrections { uploadPendingCorrections() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1986,6 +2003,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         dictationTargetApp = nil
         guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else { return }
+        recordCorrectionIfEnabled(final: text)
         // Give the window server a beat to route key focus back to the
         // frontmost app after the panel orders out, then deliver.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
@@ -2395,6 +2413,9 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
                                   action: #selector(editDictionary), keyEquivalent: "")
             dict.target = self
             menu.addItem(dict)
+
+            menu.addItem(submenuItem("Improve Dictation",
+                                     items: buildImproveDictationItems()))
 
             menu.addItem(submenuItem("Auto-unload after",
                                      items: buildSttIdleTimeoutItems()))
@@ -3411,6 +3432,192 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         config.save()
         rebuildMenu()
         scheduleRespeak()
+    }
+
+    // MARK: - Opt-in dictation corrections (text only, never audio)
+    //
+    // When the user fixes a transcript on the review card and has opted in,
+    // the (original, corrected) pair plus word confidences is appended to a
+    // local JSONL log and uploaded in batches. The log IS the disclosure:
+    // everything ever sent can be read from the menu (View Shared Data…).
+
+    private static let correctionsModel = "parakeet-tdt-0.6b-v2"
+    private let correctionsQueue = DispatchQueue(label: "ogma.corrections", qos: .utility)
+
+    private var correctionsLogPath: String {
+        (ogmaDataDir as NSString).appendingPathComponent("corrections.jsonl")
+    }
+    private var correctionsOffsetPath: String {
+        (ogmaDataDir as NSString).appendingPathComponent("corrections.uploaded")
+    }
+    private var correctionsEndpoint: URL {
+        let env = ProcessInfo.processInfo.environment["OGMA_CORRECTIONS_URL"]
+        return URL(string: env ?? "https://stoverdistributed.com/api/ogma/corrections")!
+    }
+
+    /// Random, meaningless UUID so corrections from one install can be
+    /// grouped during analysis. Contains no user or machine information.
+    private func correctionsInstallID() -> String {
+        let path = (configDir as NSString).appendingPathComponent("install-id")
+        if let id = try? String(contentsOfFile: path, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty { return id }
+        let id = UUID().uuidString
+        try? FileManager.default.createDirectory(
+            atPath: configDir, withIntermediateDirectories: true)
+        try? id.write(toFile: path, atomically: true, encoding: .utf8)
+        return id
+    }
+
+    private func recordCorrectionIfEnabled(final: String) {
+        guard config.shareCorrections else { return }
+        let original = overlay.reviewOriginalText
+        let words = overlay.reviewOriginalWords
+
+        func norm(_ s: String) -> String {
+            s.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+        // Only actual corrections are shared — untouched transcripts stay
+        // on this machine.
+        guard !original.isEmpty, norm(original) != norm(final) else { return }
+
+        let record: [String: Any] = [
+            "ts": ISO8601DateFormatter().string(from: Date()),
+            "app": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
+            "model": Self.correctionsModel,
+            "install": correctionsInstallID(),
+            "original": original,
+            "final": final,
+            "words": words.map { ["t": $0.text, "c": ($0.confidence * 1000).rounded() / 1000] },
+        ]
+        correctionsQueue.async { [self] in
+            guard let data = try? JSONSerialization.data(withJSONObject: record) else { return }
+            let fm = FileManager.default
+            try? fm.createDirectory(atPath: ogmaDataDir, withIntermediateDirectories: true)
+            if !fm.fileExists(atPath: correctionsLogPath) {
+                fm.createFile(atPath: correctionsLogPath, contents: nil)
+            }
+            if let handle = FileHandle(forWritingAtPath: correctionsLogPath) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.write(Data([0x0A]))
+                handle.closeFile()
+            }
+            drainCorrectionsLocked()
+        }
+    }
+
+    func uploadPendingCorrections() {
+        correctionsQueue.async { [self] in drainCorrectionsLocked() }
+    }
+
+    /// Upload up to 100 not-yet-sent log lines; advance the byte offset on
+    /// success. Must run on correctionsQueue. Failures just wait for the
+    /// next dictation or launch.
+    private func drainCorrectionsLocked() {
+        guard let fileData = FileManager.default.contents(atPath: correctionsLogPath) else { return }
+        let offset = Int((try? String(contentsOfFile: correctionsOffsetPath, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+        guard offset < fileData.count else { return }
+
+        let pending = fileData.subdata(in: offset..<fileData.count)
+        var records: [[String: Any]] = []
+        var consumed = 0
+        var cursor = 0
+        while records.count < 100 {
+            guard let nl = pending[cursor...].firstIndex(of: 0x0A) else { break }
+            let line = pending.subdata(in: cursor..<nl)
+            if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
+                records.append(obj)
+            }
+            cursor = nl + 1
+            consumed = cursor
+        }
+        guard !records.isEmpty,
+              let body = try? JSONSerialization.data(withJSONObject: ["records": records]) else { return }
+
+        var request = URLRequest(url: correctionsEndpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        request.timeoutInterval = 15
+
+        var ok = false
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            if let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
+                ok = true
+            }
+            sem.signal()
+        }.resume()
+        sem.wait()
+
+        if ok {
+            try? String(offset + consumed)
+                .write(toFile: correctionsOffsetPath, atomically: true, encoding: .utf8)
+            // More than one batch pending? Keep draining.
+            if offset + consumed < fileData.count { drainCorrectionsLocked() }
+        }
+    }
+
+    private static let correctionsDisclosure = """
+        When you fix a transcript on the review card, Ogma sends the correction to Stover Distributed so we can analyze where recognition goes wrong and improve it.
+
+        Each report contains only:
+        • the text the model heard
+        • the text you corrected it to
+        • per-word confidence scores
+        • a random anonymous install ID
+
+        Audio is never recorded or sent. Dictations you don't correct are never sent. Everything shared is kept in a local log you can read anytime (View Shared Data…), and you can turn this off whenever you like.
+        """
+
+    private func buildImproveDictationItems() -> [NSMenuItem] {
+        let share = NSMenuItem(title: "Share Corrections",
+                               action: #selector(toggleShareCorrections), keyEquivalent: "")
+        share.target = self
+        share.state = config.shareCorrections ? .on : .off
+        let what = NSMenuItem(title: "What Gets Shared\u{2026}",
+                              action: #selector(showWhatGetsShared), keyEquivalent: "")
+        what.target = self
+        let view = NSMenuItem(title: "View Shared Data\u{2026}",
+                              action: #selector(viewSharedCorrections), keyEquivalent: "")
+        view.target = self
+        return [share, what, view]
+    }
+
+    @objc private func toggleShareCorrections() {
+        if config.shareCorrections {
+            config.shareCorrections = false
+            config.save()
+            rebuildMenu()
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Share Dictation Corrections?"
+        a.informativeText = Self.correctionsDisclosure
+        a.addButton(withTitle: "Share Corrections")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        config.shareCorrections = true
+        config.save()
+        rebuildMenu()
+    }
+
+    @objc private func showWhatGetsShared() {
+        showNote("What Gets Shared", Self.correctionsDisclosure)
+    }
+
+    @objc private func viewSharedCorrections() {
+        guard FileManager.default.fileExists(atPath: correctionsLogPath) else {
+            showNote("No Data Yet",
+                     "Nothing has been collected. Corrections are logged here only after you turn on Share Corrections and fix a transcript on the review card.")
+            return
+        }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-e", correctionsLogPath]
+        try? task.run()
     }
 
     // MARK: - Credits Display
