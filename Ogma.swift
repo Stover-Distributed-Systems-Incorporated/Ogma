@@ -2076,10 +2076,14 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         let myPid = ProcessInfo.processInfo.processIdentifier
         if let front = NSWorkspace.shared.frontmostApplication,
            front.processIdentifier != pid_t(myPid) {
-            // Secure input (password field) or no focused UI element: a
-            // synthetic ⌘V would vanish and the clipboard restore would then
-            // destroy the transcript. Copy instead.
-            if IsSecureEventInputEnabled() || !hasFocusedElement(pid: front.processIdentifier) {
+            // Only secure input (password field) forces the clipboard fallback:
+            // there a synthetic ⌘V genuinely cannot land, and pasting-then-
+            // restoring would destroy the transcript. Every other app — including
+            // AX-opaque terminals (Ghostty) and Electron/web views that expose no
+            // focused element yet accept ⌘V fine — gets the real paste. injectText
+            // is fail-safe: if the paste misses, it leaves the transcript on the
+            // clipboard rather than restoring over it.
+            if IsSecureEventInputEnabled() {
                 copyTranscriptFallback(text)
             } else {
                 injectText(text)
@@ -2104,10 +2108,12 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         }
     }
 
-    // The app already holds Accessibility trust — ask where keyboard focus
-    // is. Only a definitive "nothing focused" blocks the paste; apps with
-    // broken AX support get the benefit of the doubt.
-    private func hasFocusedElement(pid: pid_t) -> Bool {
+    // The app already holds Accessibility trust — ask whether the target has a
+    // focused UI element. This is now advisory ONLY for injectText's restore
+    // decision, never a paste gate: a `.noValue` (AX-opaque apps like Ghostty)
+    // just means "don't restore the old clipboard over the transcript," so an
+    // AX false-negative costs at most a retained clipboard entry, never a paste.
+    private func axHasFocusedElement(pid: pid_t) -> Bool {
         let app = AXUIElementCreateApplication(pid)
         // A hung target must not beachball us for the default ~6s AX timeout.
         AXUIElementSetMessagingTimeout(app, 0.3)
@@ -2143,16 +2149,23 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
 
     // Insert transcribed text at the cursor via the pasteboard + ⌘V, then
     // restore the previous clipboard. Uses the app's existing Accessibility
-    // grant (same as the ⌥⇧/ ⌘C synthesis). The restore is skipped if the
-    // pasteboard changed again in the meantime (e.g. the user copied
-    // something), and waits 1s so a busy target still pastes the transcript,
-    // not the restored old clipboard.
+    // grant (same as the ⌥⇧/ ⌘C synthesis). Waits 1s so a busy target still
+    // pastes the transcript, not the restored old clipboard.
+    //
+    // Fail-safe restore: since the paste is now unconditional (no AX pre-gate),
+    // we only restore the old clipboard when there's positive evidence the paste
+    // had a live target — otherwise we leave the transcript on the clipboard so a
+    // missed paste can never lose it. Restore only if: (a) the user hasn't copied
+    // since, (b) the same app is still frontmost and secure input isn't engaged,
+    // and (c) that app actually exposed a focused element. Any "no" keeps the
+    // transcript on the clipboard for a manual ⌘V.
     private func injectText(_ text: String) {
         let pb = NSPasteboard.general
         let saved = pb.string(forType: .string)
         pb.clearContents()
         pb.setString(text, forType: .string)
         let myChange = pb.changeCount
+        let targetPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         let src = CGEventSource(stateID: .hidSystemState)
         let vDown = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: true)  // 9 = V
@@ -2162,10 +2175,17 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         vDown?.post(tap: .cgAnnotatedSessionEventTap)
         vUp?.post(tap: .cgAnnotatedSessionEventTap)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            guard pb.changeCount == myChange else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard pb.changeCount == myChange else { return }   // (a) user copied since — never clobber
+            let stillSafe = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
+                && !IsSecureEventInputEnabled()
+            guard stillSafe else { return }                    // (b) foreground changed / secure — keep transcript
+            if let pid = targetPid, self?.axHasFocusedElement(pid: pid) == false {
+                return                                         // (c) no editable focus was there — keep transcript
+            }
+            guard let saved = saved else { return }
             pb.clearContents()
-            if let saved = saved { pb.setString(saved, forType: .string) }
+            pb.setString(saved, forType: .string)
         }
     }
 

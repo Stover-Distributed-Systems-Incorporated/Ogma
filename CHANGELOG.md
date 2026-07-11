@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.2.1
+
+### Bug fixes
+
+- **Dictation now inserts into terminals and other Accessibility-opaque apps.** Pressing Insert on the review card pasted at the cursor in most apps, but silently fell back to *"Transcript copied — press ⌘V"* whenever the target app exposed no focused element to Accessibility — GPU-rendered terminals (Ghostty and others) and some Electron/web views. A synthetic ⌘V lands in those apps perfectly, so Ogma now pastes there directly instead of giving up.
+- The clipboard fallback is now reserved for **secure-input (password) fields**, the one place a synthetic keystroke genuinely cannot go. Everywhere else, the paste is attempted — and it is **fail-safe**: if a paste ever misses (no editable focus, focus vanished), the transcript is left on the clipboard for a manual ⌘V rather than being restored over, so it can never be lost.
+
 ## v2.2.0
 
 ### Highlights
