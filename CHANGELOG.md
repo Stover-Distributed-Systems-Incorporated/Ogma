@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.2.2
+
+### Bug fixes
+
+- **Cleaner first word.** Dictation now prepends a short lead-in of silence (300ms) to the audio stream before your first spoken word, so the streaming model decodes the word's onset with real left context instead of catching it at the very edge of the buffer. This most often garbled the opening word or two — especially on a cold start, where you tend to start talking the instant you press `⌥⇧D`. Tunable via `STT_LEAD_SILENCE` (seconds; `0` disables).
+
 ## v2.2.1
 
 ### Bug fixes

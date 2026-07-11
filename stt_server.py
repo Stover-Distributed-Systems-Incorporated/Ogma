@@ -47,6 +47,13 @@ CONFIG_FILE = (os.path.join(DATA_DIR, "config") if _data_dir_override
 # The Parakeet model to load.  Override with the STT_MODEL env var.
 MODEL_ID = os.environ.get("STT_MODEL", "mlx-community/parakeet-tdt-0.6b-v2")
 
+# Leading silence (seconds) prepended to a stream before the user's first
+# audio.  Streaming ASR decodes the first word much more reliably with a bit
+# of leading context than when speech starts at the very edge of the buffer —
+# which is exactly what happens on a cold start, where you tend to start
+# talking the instant you press the hotkey.  Set STT_LEAD_SILENCE=0 to disable.
+LEAD_SILENCE_SEC = float(os.environ.get("STT_LEAD_SILENCE", "0.3"))
+
 # Idle timeout: the model is released after this long with no requests.
 # Resolved fresh on each check (see effective_timeout) so the menu bar's
 # "Auto-unload after" picker applies to a running daemon.  Shares the same
@@ -573,7 +580,12 @@ def handle_stream(conn, request, initial=b""):
     # So we accumulate here and only push ~0.5 s at a time to the model,
     # regardless of the client's frame size.
     chunk_samples = int(0.5 * target_sr)
-    pending = np.zeros(0, dtype=np.float32)
+    # Prime the buffer with a short lead-in of silence so the model has left
+    # context for the very first word instead of decoding its onset at the
+    # buffer edge (see LEAD_SILENCE_SEC).  The first real chunk is then decoded
+    # as [silence + speech onset] in one pass.
+    lead = int(LEAD_SILENCE_SEC * target_sr)
+    pending = np.zeros(lead, dtype=np.float32) if lead > 0 else np.zeros(0, dtype=np.float32)
 
     final = ""
     final_words = []
