@@ -70,11 +70,11 @@ The waveform icon pulses while audio is being generated and played, so you alway
 
 Text copied from PDFs, LaTeX documents, and Markdown files is automatically cleaned up before reading -- math equations, SI units, Greek letters, citations, and formatting artifacts are converted to natural spoken language.
 
-Your API key is stored in your macOS Keychain — never written to a file. Dictation runs entirely on your machine; nothing you say is uploaded anywhere unless you explicitly opt in to **Share Corrections** (text only, never audio — see Settings below).
+Your API key is stored in your macOS Keychain — never written to a file. Dictation audio and transcripts are processed entirely on your machine and are never uploaded.
 
 ## Settings
 
-Click the **waveform icon** in the menu bar. The menu adapts to your setup — you only see settings that apply. Use the **Backend** submenu to switch between **Auto** (cloud + local fallback), **ElevenLabs** (cloud only), and **Local** (offline only).
+Click the **waveform icon** in the menu bar. The menu adapts to your setup — you only see settings that apply. Use **TTS Engine** at the top to switch between **Auto** (cloud + local fallback), **ElevenLabs** (cloud only), and **Local** (offline only).
 
 ### ElevenLabs settings
 
@@ -95,9 +95,9 @@ Click the **waveform icon** in the menu bar. The menu adapts to your setup — y
 | **Voice** | 12 curated English voices (American and British) |
 | **Speed** | 0.5× to 2× |
 
-### Dictation (Parakeet STT, Apple Silicon)
+### Dictation (Parakeet / Voxtral STT, Apple Silicon)
 
-Press `⌥⇧D` to start dictating anywhere — a floating **card** shows the live transcript as you speak, wrapping and growing as you go. Press `⌥⇧D` again to stop, and the same card becomes interactive:
+Press `⌥⇧D` to start dictating anywhere. The default **Detailed** recording indicator shows the live transcript as you speak. Press `⌥⇧D` again to stop; when **Review before insert** is enabled, the final transcript appears in an interactive review card:
 
 - **✓ Insert** (`Return`) — paste the transcript at your cursor. Click into another app first to redirect it there.
 - **Edit** — just click the text and type; your edits show in gray so you can tell them apart from the transcription. `Shift+Return` adds a newline.
@@ -110,11 +110,14 @@ Filler words (*um, uh, er, hmm…*) are removed automatically — they never eve
 
 **Personal dictionary:** click **Dictionary…** in the menu to add names and jargon (one word per line, `#` for comments — it's a plain file at `~/.config/ogma/dictionary.txt` if you prefer an editor; changes apply immediately either way). When dictation mishears one of your words, the chip offers it as the ↻ replacement — matching is *phonetic*, so `Xanthippe` is found even when the model heard "Zantipi". Your dictionary words are also protected: autocorrect will never suggest changing them.
 
+**STT Engine:** two on-device models are available under **STT Engine** at the top of the Dictation section. **Parakeet** (default, ~2.4 GB) is fast and light, with sub-second live updates. **Voxtral** (Voxtral Realtime 4B, an extra ~3.2 GB Apache-licensed download on first selection) runs a language-model decoder for noticeably better grammar, punctuation, and sentence structure. Voxtral incrementally caches each audio chunk instead of re-decoding the recording: Detailed mode shows its live text, while None and Simple advance the same high-quality transcription silently for near-instant finalization. Only one model is in memory at a time; if Voxtral ever fails to load, dictation automatically falls back to Parakeet. Confidence highlighting and ↻ suggestions apply to Parakeet transcripts only — Voxtral doesn't report per-word confidence.
+
 | Setting | Options |
 |---------|---------|
+| **STT Engine** | Parakeet (fast, default) or Voxtral (best accuracy — better grammar and punctuation, ~3.5 GB in memory while loaded). |
+| **Recording Indicator** | **None:** animated menu-bar waveform only. **Simple:** animated menu-bar waveform plus a compact speech-responsive audio meter and Stop Recording button. **Detailed** (default): the existing live transcript card. |
 | **Review before insert** | On (default) — show the review card when dictation stops. Off — paste immediately, as if the card didn't exist. |
 | **Auto-unload after** | How long the speech model stays in memory after the last dictation (default 2 minutes). |
-| **Improve Dictation → Share Corrections** | Off (default). Opt in to send your review-card corrections — the text the model heard, the text you fixed it to, and word confidence scores — so recognition errors can be analyzed and improved. **Audio is never recorded or sent**, uncorrected dictations are never sent, and **View Shared Data…** opens the local log of everything that has been shared. |
 
 ### Playback settings
 
@@ -123,6 +126,10 @@ Filler words (*um, uh, er, hmm…*) are removed automatically — they never eve
 | **Sentence Pause** | Milliseconds of silence between sentences (default 400ms). Scales inversely with speed -- at 2× speed, a 400ms pause becomes 200ms. Click the menu item and type any value; set to 0 for no pause. |
 
 Settings take effect immediately — no restart needed.
+
+### Future features — not included in this build
+
+Additional opt-in API engines for audio generation or transcription may be offered in a future release. They are not implemented in this build. Current dictation remains on-device.
 
 ### ElevenLabs voices
 
@@ -206,8 +213,10 @@ LOCAL_VOICE="bf_lily"
 LOCAL_SPEED="1.00"
 LOCAL_IDLE_TIMEOUT="120"
 STT_IDLE_TIMEOUT="120"
+STT_ENGINE="parakeet"
+STT_ENGINES_INSTALLED="parakeet"
 DICTATION_REVIEW="true"
-SHARE_CORRECTIONS="false"
+RECORDING_INDICATOR="detailed"
 SENTENCE_PAUSE="400"
 ```
 

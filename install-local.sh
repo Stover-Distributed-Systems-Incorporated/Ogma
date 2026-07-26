@@ -14,6 +14,14 @@ set -eo pipefail
 
 VENV_DIR="${VENV_DIR:-$HOME/.local/share/ogma/venv}"
 
+# ── Options ──────────────────────────────────────────────────────
+# --with-voxtral (or OGMA_INSTALL_VOXTRAL=1) additionally downloads the
+# Voxtral Realtime 4B dictation model (~3.2 GB) for the "voxtral" STT engine.
+WITH_VOXTRAL="${OGMA_INSTALL_VOXTRAL:-0}"
+for _arg in "$@"; do
+    [ "$_arg" = "--with-voxtral" ] && WITH_VOXTRAL=1
+done
+
 # ── Apple Silicon check ──────────────────────────────────────────
 if [ "$(uname -m)" != "arm64" ]; then
     echo "Local TTS requires Apple Silicon (M1 or later)." >&2
@@ -140,7 +148,7 @@ else
     echo "Installing mlx-audio and dependencies…"
     set +e
     "$VENV_DIR/bin/pip" install --upgrade pip 2>&1
-    "$VENV_DIR/bin/pip" install mlx-audio soundfile sounddevice scipy loguru \
+    "$VENV_DIR/bin/pip" install "mlx-audio>=0.4.6" soundfile sounddevice scipy loguru \
         "misaki==0.8.4" num2words spacy phonemizer-fork espeakng_loader pysbd ftfy pylatexenc 2>&1
     pip_exit=$?
     set -e
@@ -213,6 +221,42 @@ if "$VENV_DIR/bin/python3" -c "import parakeet_mlx" 2>/dev/null; then
     fi
 fi
 
+# ── Voxtral STT engine (opt-in) ────────────────────────────────
+# Voxtral support is provided by mlx-audio itself, avoiding a separate package
+# with a personal-use-only license. Keep the model repo id in sync with
+# stt_server.py.
+VOXTRAL_MODEL="mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
+VOXTRAL_OK=0
+if [ "$WITH_VOXTRAL" = "1" ]; then
+    if ! "$VENV_DIR/bin/python3" -c "from mlx_audio.stt.models.voxtral_realtime import Model; assert hasattr(Model, 'create_streaming_session')" 2>/dev/null; then
+        echo "Upgrading mlx-audio for Voxtral dictation…"
+        set +e
+        "$VENV_DIR/bin/python3" -m pip install --upgrade "mlx-audio>=0.4.6" 2>&1
+        pip_vox_exit=$?
+        set -e
+        if [ $pip_vox_exit -ne 0 ]; then
+            echo "Failed to upgrade mlx-audio for Voxtral." >&2
+        fi
+    fi
+    if "$VENV_DIR/bin/python3" -c "from mlx_audio.stt.models.voxtral_realtime import Model; assert hasattr(Model, 'create_streaming_session')" 2>/dev/null; then
+        if "$VENV_DIR/bin/python3" -c "from huggingface_hub import try_to_load_from_cache as cached; assert cached('$VOXTRAL_MODEL', 'config.json') is not None; assert cached('$VOXTRAL_MODEL', 'model.safetensors') is not None" 2>/dev/null; then
+            echo "Voxtral model already cached."
+            VOXTRAL_OK=1
+        else
+            echo "Downloading Voxtral dictation model (~3.2 GB)…"
+            set +e
+            "$VENV_DIR/bin/python3" -c "from huggingface_hub import snapshot_download; snapshot_download('$VOXTRAL_MODEL')" 2>&1
+            vox_exit=$?
+            set -e
+            if [ $vox_exit -eq 0 ]; then
+                VOXTRAL_OK=1
+            else
+                echo "Failed to download the Voxtral model." >&2
+            fi
+        fi
+    fi
+fi
+
 # ── Update config (skip for dev/test venvs) ──────────────────────
 if [ "$VENV_DIR" = "$HOME/.local/share/ogma/venv" ]; then
     _CONFIG="$HOME/.config/ogma/config"
@@ -236,5 +280,22 @@ LOCAL_SPEED="1.0"
 EOF
     fi
 
+    # Mark the Voxtral engine as installed only after a successful download.
+    if [ "$VOXTRAL_OK" = "1" ]; then
+        printf '%s\n' "$VOXTRAL_MODEL" > "$HOME/.local/share/ogma/voxtral-model-id"
+        if grep -q '^STT_ENGINES_INSTALLED=' "$_CONFIG"; then
+            sed -i '' 's/^STT_ENGINES_INSTALLED=.*/STT_ENGINES_INSTALLED="both"/' "$_CONFIG"
+        else
+            printf 'STT_ENGINES_INSTALLED="both"\n' >> "$_CONFIG"
+        fi
+        echo "Config updated: Voxtral engine available."
+    fi
+
     echo "Config updated: local TTS available."
+fi
+
+# A requested-but-failed Voxtral install must fail the script so callers
+# (the menu app) can surface the error and roll back the engine choice.
+if [ "$WITH_VOXTRAL" = "1" ] && [ "$VOXTRAL_OK" != "1" ]; then
+    exit 1
 fi

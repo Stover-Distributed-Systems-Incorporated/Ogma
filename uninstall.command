@@ -43,11 +43,16 @@ step "Accessibility permission removed"
 
 # ── Remove the app bundle ─────────────────────────────────────────
 rm -rf "$HOME/Applications/Ogma.app"
-# pkg installs land in /Applications; the receipt forget needs root and
-# is harmless if left behind, so both are best-effort.
-rm -rf "/Applications/Ogma.app" 2>/dev/null || true
-pkgutil --forget com.ogma.app 2>/dev/null || true
-step "App bundle removed"
+# Package installs land in /Applications and are normally root-owned. Ask once
+# for the required authority, then report accurately if the user declines.
+if [ -d "/Applications/Ogma.app" ]; then
+    osascript -e 'do shell script "rm -rf /Applications/Ogma.app; pkgutil --forget com.ogma.app >/dev/null 2>&1 || true" with administrator privileges' 2>/dev/null || true
+fi
+if [ -e "/Applications/Ogma.app" ]; then
+    step "App bundle in /Applications was not removed (administrator permission was declined)"
+else
+    step "App bundle removed"
+fi
 
 # ── Remove scripts ────────────────────────────────────────────────
 rm -f "$HOME/.local/bin/speak.sh"

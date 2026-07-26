@@ -907,7 +907,7 @@ def _phaseA(t):
     def _verbalize_url(m):
         s = m.group()
         trail = ''
-        while s and s[-1] in '.,;:?!)\]\x22\x27':
+        while s and s[-1] in '.,;:?!)\x5d\x22\x27':
             trail = s[-1] + trail
             s = s[:-1]
         s = s.replace('/', ' slash ')

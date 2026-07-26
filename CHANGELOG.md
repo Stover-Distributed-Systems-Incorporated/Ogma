@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+## v2.3.0
+
+### Bug fixes
+
+- Fixed a crash after successful dictation when Ogma tried to preserve a nonempty clipboard. Clipboard items are now snapshotted representation-by-representation instead of receiving an unsupported Objective-C `copy()` message.
+- Voxtral now uses `mlx-audio`'s stateful streaming caches instead of repeatedly decoding the entire recording. Detailed mode receives live Voxtral text; None and Simple run the higher-quality stream silently and only publish the final.
+
+### Menu and recording controls
+
+- **Backend** is now **TTS Engine** and leads the TTS controls; **Engine** is now **STT Engine** and leads the Dictation controls.
+- **Sentence Pause** now closes the TTS section, while the standalone **Speed Read…** action has moved to the bottom of the menu.
+- A new **Recording Indicator** setting offers **None** (animated menu-bar waveform only), **Simple** (speech-responsive audio meter with a Stop Recording button), and **Detailed** (the existing live transcript card).
+- **Improve Dictation / Share Corrections** has been removed. Dictation audio, transcripts, and edits remain on-device.
+- **Future — not in this build:** additional opt-in API engines for audio generation or transcription.
+
+### Highlights
+
+**A second dictation engine: Voxtral Realtime 4B.** A new **STT Engine** picker in the Dictation menu offers **Voxtral (best accuracy)** alongside the default **Parakeet (fast)**. Voxtral runs a language-model decoder, so transcripts come out with markedly better grammar, punctuation, and sentence structure — the things n-gram autocorrect could never fix. It's an opt-in ~3.2 GB Apache-2.0 download (4-bit MLX quantization, via `mlx-audio`), entirely on-device like everything else.
+
+### Details
+
+- **The live transcript IS Voxtral**: Detailed mode displays text from Voxtral's stateful streaming decoder, while None and Simple advance the same transcript silently — no repeated full-recording decodes and no jarring model swap when you stop
+- **One model in memory at a time** (~3.5 GB in Voxtral mode); if Voxtral can't load, the daemon falls back to Parakeet and dictation keeps working
+- Confidence tinting and ↻ suggestion chips remain a Parakeet feature (Voxtral reports no per-word confidences; its transcripts rarely need them)
+- Shared corrections were tagged with the engine that produced the final. This sharing feature is removed in the current build.
+- `STT_ENGINE="voxtral"` / `"parakeet"` in `~/.config/ogma/config`; install via the menu or `bash install-local.sh --with-voxtral`
+- Voxtral gets the same lead-in-silence onset fix that v2.2.2 gave streaming and uses deterministic decoding so verbatim repeats remain stable
+
 ## v2.2.2
 
 ### Bug fixes
@@ -17,7 +47,9 @@
 
 ### Highlights
 
-**Help fix what dictation gets wrong — opt-in.** A new **Improve Dictation → Share Corrections** setting (off by default) sends your review-card corrections to Stover Distributed so recognition errors can be analyzed and fixed. Only text is ever shared: what the model heard, what you corrected it to, per-word confidence scores, and a random anonymous install ID. **Audio is never recorded or sent**, dictations you don't correct are never sent, and everything shared is kept in a local log you can open from the menu (**View Shared Data…**) — the log *is* the disclosure.
+> Historical note: this opt-in sharing feature was introduced in v2.2.0 and has been removed from the current build.
+
+**Help fix what dictation gets wrong — opt-in.** A new **Improve Dictation → Share Corrections** setting (off by default) sent review-card corrections to Stover Distributed so recognition errors could be analyzed. Only text was shared; audio was never sent.
 
 ### Details
 

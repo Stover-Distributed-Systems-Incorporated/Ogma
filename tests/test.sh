@@ -53,7 +53,12 @@ _bootstrap_venv() {
     fi
     echo "$_DEP_HASH" > "$_STAMP"
 }
-if [ ! -x "$DEV_VENV/bin/python3" ]; then
+if [ "${OGMA_SKIP_BOOTSTRAP:-0}" = "1" ]; then
+    if [ ! -x "$DEV_VENV/bin/python3" ]; then
+        echo "OGMA_SKIP_BOOTSTRAP=1 requires an existing .venv" >&2
+        exit 1
+    fi
+elif [ ! -x "$DEV_VENV/bin/python3" ]; then
     printf "Bootstrapping dev venv (full install) ...\n"
     _bootstrap_venv
 elif [ "$_DEP_HASH" != "$(cat "$_STAMP" 2>/dev/null)" ]; then
@@ -101,14 +106,16 @@ section() {
 
 section "Config variable priority"
 
-# Inline the sourcing logic from speak.sh so we can test it in isolation.
+# Load the exact safe parser function from speak.sh so these tests exercise the
+# product code without running the rest of the speech pipeline.
 resolve_voice() {
     local conf="$1" env_var="${2:-}"
     (
         unset VOICE_ID ELEVENLABS_VOICE_ID
         [ -n "$env_var" ] && export ELEVENLABS_VOICE_ID="$env_var"
         _CONFIG="$conf"
-        [ -f "$_CONFIG" ] && source "$_CONFIG"
+        eval "$(sed -n '/^_config_value()/,/^}/p' "$SPEAK_SH")"
+        VOICE_ID="$(_config_value VOICE_ID)"
         VOICE_ID="${ELEVENLABS_VOICE_ID:-${VOICE_ID:-pFZP5JQG7iQjIQuC4Bku}}"
         echo "$VOICE_ID"
     )
@@ -179,6 +186,17 @@ TMPCONF2=$(mktemp)
 printf "VOICE_ID='single-quoted'\n" > "$TMPCONF2"
 check "single-quoted values parsed (bash)" \
     "single-quoted" "$(resolve_voice "$TMPCONF2")"
+
+_CONFIG_SENTINEL=$(mktemp)
+rm -f "$_CONFIG_SENTINEL"
+TMPCONF3=$(mktemp)
+printf 'VOICE_ID="$(touch %s)"\n' "$_CONFIG_SENTINEL" > "$TMPCONF3"
+_MALICIOUS_VALUE=$(resolve_voice "$TMPCONF3")
+check "config values are returned as data, never executed" \
+    "no" "$([ -e "$_CONFIG_SENTINEL" ] && echo yes || echo no)"
+check "command-substitution text remains literal" \
+    "\$(touch $_CONFIG_SENTINEL)" "$_MALICIOUS_VALUE"
+rm -f "$TMPCONF3" "$_CONFIG_SENTINEL"
 rm -f "$TMPCONF" "$TMPCONF2"
 
 # ── 2b. Config numeric validation ────────────────────────────────
@@ -364,6 +382,9 @@ check "done dialog conditions model message on mlx_ok" \
 section "uninstall.command syntax"
 
 check "bash syntax valid" "0" "$(bash -n "$SCRIPT_DIR/uninstall.command" 2>/dev/null; echo $?)"
+check "packaged app removal requests administrator privileges" \
+    "yes" "$(grep -q 'with administrator privileges' "$SCRIPT_DIR/uninstall.command" && \
+             grep -q '\\[ -e "/Applications/Ogma.app" \\]' "$SCRIPT_DIR/uninstall.command" && echo yes || echo no)"
 
 # ── 10. Swift source structure ────────────────────────────────────
 
@@ -406,6 +427,68 @@ check "Swift: pickSpeed calls scheduleRespeak" \
 check "Swift: pickVoice calls scheduleRespeak" \
     "yes" "$(awk '/func pickVoice/,/^    \}/' "$SETTINGS_SWIFT" | grep -q 'scheduleRespeak' && echo "yes" || echo "no")"
 
+check "Swift: bundled helper sync verifies every helper before version short-circuit" \
+    "yes" "$(grep -q 'let helpersReady = bundledNames.allSatisfy' "$SETTINGS_SWIFT" && \
+             grep -q 'if copiedEverything' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Swift: Speed Reader cancellation uses generation IDs and returns partial paths for cleanup" \
+    "yes" "$(grep -q 'isCurrentSpeedReadGeneration' "$SETTINGS_SWIFT" && \
+             grep -q 'cleanupIncomingClips' "$SETTINGS_SWIFT" && \
+             grep -q 'completion(clips)' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Swift: recording indicator preference persists all three modes" \
+    "yes" "$(grep -q 'var recordingIndicator.*detailed' "$SETTINGS_SWIFT" && \
+             grep -q 'case \"RECORDING_INDICATOR\"' "$SETTINGS_SWIFT" && \
+             grep -q 'RECORDING_INDICATOR=.*recordingIndicator' "$SETTINGS_SWIFT" && \
+             grep -q 'case none, simple, detailed' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Swift: recording indicator menu exposes None, Simple, and Detailed" \
+    "yes" "$(awk '/func buildRecordingIndicatorItems/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'None.*menu bar only' && \
+             awk '/func buildRecordingIndicatorItems/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'Simple.*audio meter' && \
+             awk '/func buildRecordingIndicatorItems/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'Detailed.*live transcript' && echo yes || echo no)"
+
+check "Swift: Simple indicator uses live microphone level and has Stop Recording" \
+    "yes" "$(grep -q 'class RecordingWaveformView' "$SETTINGS_SWIFT" && \
+             grep -q 'sumSquares.*sample.*sample' "$SETTINGS_SWIFT" && \
+             grep -q 'Stop Recording' "$SETTINGS_SWIFT" && \
+             grep -q 'recordingOverlay.onStop.*stopDictation' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Swift: Detailed alone opens and updates the live transcript card" \
+    "yes" "$(awk '/private func beginRecording/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'case .detailed' && \
+             awk '/private func beginRecording/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'overlay.beginLiveDictation' && \
+             awk '/private func beginRecording/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'recordingIndicatorMode == .detailed' && echo yes || echo no)"
+
+_menu_order_ok=$(python3 - "$SETTINGS_SWIFT" <<'PYEOF'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+menu = s[s.index("private func rebuildMenu()"):s.index("// MARK: Menu builders")]
+labels = [
+    'submenuItem("TTS Engine"',
+    '"Sentence Pause:',
+    'submenuItem("STT Engine"',
+    'submenuItem("Recording Indicator"',
+    '"Speed Read',
+    '"Quit"',
+]
+try:
+    positions = [menu.index(label) for label in labels]
+    print("yes" if positions == sorted(positions) else "no")
+except ValueError:
+    print("no")
+PYEOF
+)
+check "Swift: menu order is TTS Engine, Sentence Pause, STT controls, Speed Reader, Quit" \
+    "yes" "$_menu_order_ok"
+
+check "Swift: dictation correction sharing and its network endpoint are removed" \
+    "yes" "$(! grep -q 'var shareCorrections\\|recordCorrectionIfEnabled\\|uploadPendingCorrections\\|buildImproveDictationItems\\|OGMA_CORRECTIONS_URL\\|api/ogma/corrections' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
 # ── 11. Swift compile (slow ~15s) ────────────────────────────────
 
 section "Ogma.swift compile"
@@ -421,6 +504,8 @@ else
     if xcrun swiftc "$SETTINGS_SWIFT" -o "$TMPBIN" -O 2>/dev/null; then
         check "compiles without errors" "yes" "yes"
         check "binary is executable"    "yes" "$( [ -x "$TMPBIN" ] && echo yes || echo no )"
+        check "clipboard snapshot runtime regression" \
+            "yes" "$( "$TMPBIN" --self-test-pasteboard-snapshot && echo yes || echo no )"
         rm -f "$TMPBIN"
     else
         check "compiles without errors" "yes" "no"
@@ -1870,6 +1955,112 @@ check "stt_server.py: streaming mode via transcribe_stream" \
              grep -q 'transcribe_stream' "$STT_SERVER" && \
              grep -q '\"mode\") == \"stream\"' "$STT_SERVER" && echo "yes" || echo "no")"
 
+check "Voxtral uses one stateful streaming session, never repeated batch decode" \
+    "yes" "$(grep -q 'create_streaming_session' "$STT_SERVER" && \
+             grep -q 'session.step' "$STT_SERVER" && \
+             grep -q 'session.close' "$STT_SERVER" && \
+             ! sed -n '/def handle_stream_voxtral/,/^def handle_client/p' "$STT_SERVER" | \
+                 grep -q 'voxtral_transcribe' && echo "yes" || echo "no")"
+
+check "Ogma requests partials only for a visible detailed transcript" \
+    "yes" "$(grep -q 'want_partials' "$SETTINGS_SWIFT" && \
+             grep -q 'wantsPartials: recordingIndicatorMode == .detailed' "$SETTINGS_SWIFT" && \
+             grep -q 'wantsPartials: true' "$SETTINGS_SWIFT" && echo "yes" || echo "no")"
+
+_voxtral_stream_ok=$("$VENV_PYTHON" - "$STT_SERVER" <<'PYEOF'
+import importlib.util
+import json
+import struct
+import sys
+
+import numpy as np
+
+spec = importlib.util.spec_from_file_location("ogma_stt_stream_test", sys.argv[1])
+stt = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(stt)
+stt.filter_fillers_enabled = lambda: False
+stt.write_state = lambda: None
+stt.log = lambda _message: None
+stt.shutdown_event.clear()
+
+
+class FakeSession:
+    def __init__(self):
+        self.fed = []
+        self.closed = False
+        self.done = False
+        self.emitted = False
+
+    def feed(self, samples):
+        self.fed.append(samples.copy())
+
+    def close(self):
+        self.closed = True
+
+    def step(self, *, max_decode_tokens):
+        if not self.emitted and self.fed:
+            self.emitted = True
+            return ["cached final text"]
+        if self.closed:
+            self.done = True
+        return []
+
+
+class FakeModel:
+    def __init__(self):
+        self.delays = []
+        self.sessions = []
+
+    def create_streaming_session(self, **kwargs):
+        self.delays.append(kwargs["transcription_delay_ms"])
+        session = FakeSession()
+        self.sessions.append(session)
+        return session
+
+
+class FakeConnection:
+    def __init__(self):
+        self.sent = []
+        self.reads = [struct.pack(">I", 0)]
+
+    def settimeout(self, _timeout):
+        pass
+
+    def recv(self, _size):
+        return self.reads.pop(0)
+
+    def sendall(self, payload):
+        self.sent.extend(
+            json.loads(line) for line in payload.decode().splitlines())
+
+
+model = FakeModel()
+stt.voxtral = model
+audio = np.linspace(-0.1, 0.1, 1600, dtype="<f4").tobytes()
+initial = struct.pack(">I", len(audio)) + audio
+
+silent = FakeConnection()
+stt.handle_stream_voxtral(
+    silent, {"sample_rate": 16000, "want_partials": False}, initial)
+detailed = FakeConnection()
+stt.handle_stream_voxtral(
+    detailed, {"sample_rate": 16000, "want_partials": True}, initial)
+
+assert model.delays == [2400, 480], model.delays
+assert all(len(session.fed) == 1 for session in model.sessions)
+assert not any("partial" in message for message in silent.sent), silent.sent
+assert any(message.get("partial") == "cached final text"
+           for message in detailed.sent), detailed.sent
+for connection in (silent, detailed):
+    final = [message for message in connection.sent if "final" in message]
+    assert len(final) == 1, connection.sent
+    assert final[0]["final"] == "cached final text", final
+print("ok")
+PYEOF
+) || _voxtral_stream_ok="no"
+check "Voxtral modes: silent=2400ms/no partials, detailed=480ms/partials" \
+    "ok" "$_voxtral_stream_ok"
+
 check "Ogma.swift: live streaming client + floating caption overlay" \
     "yes" "$(grep -q 'class STTStreamClient' "$SETTINGS_SWIFT" && \
              grep -q 'class DictationOverlay' "$SETTINGS_SWIFT" && \
@@ -2079,7 +2270,29 @@ check "Ogma.swift: review card (nonactivating key panel, insert/edit/discard)" \
 check "Ogma.swift: paste verified; transcript falls back to clipboard" \
     "yes" "$(grep -q 'deliverTranscript' "$SETTINGS_SWIFT" && \
              grep -q 'copyTranscriptFallback' "$SETTINGS_SWIFT" && \
-             grep -q 'hasFocusedElement' "$SETTINGS_SWIFT" && echo "yes" || echo "no")"
+             grep -q 'editablePasteTarget' "$SETTINGS_SWIFT" && \
+             grep -q 'current.value.contains(text)' "$SETTINGS_SWIFT" && \
+             grep -q 'snapshotPasteboardItems' "$SETTINGS_SWIFT" && \
+             ! grep -q '\\.copy() as? NSPasteboardItem' "$SETTINGS_SWIFT" && echo "yes" || echo "no")"
+
+check "speak.sh: reads config without executing it" \
+    "yes" "$(grep -q '_config_value()' "$SCRIPT_DIR/speak.sh" && \
+             ! grep -q 'source "\$_CONFIG"' "$SCRIPT_DIR/speak.sh" && echo "yes" || echo "no")"
+
+check "Ogma.swift: preserves helper-owned config entries" \
+    "yes" "$(grep -q 'preservedLines' "$SETTINGS_SWIFT" && \
+             grep -q 'output.append(contentsOf: preserved)' "$SETTINGS_SWIFT" && echo "yes" || echo "no")"
+
+check "Voxtral uses the Apache-licensed MLX Community realtime model" \
+    "yes" "$(grep -q 'mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit' "$STT_SERVER" && \
+             grep -q 'mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit' "$SCRIPT_DIR/install-local.sh" && \
+             grep -q 'mlx-audio>=0.4.6' "$SCRIPT_DIR/install-local.sh" && \
+             ! grep -q 'mlx_voxtral' "$STT_SERVER" && echo "yes" || echo "no")"
+
+check "Voxtral installed state is tied to the exact complete model" \
+    "yes" "$(grep -q 'voxtral-model-id' "$SETTINGS_SWIFT" && \
+             grep -q 'model.safetensors' "$SCRIPT_DIR/install-local.sh" && \
+             grep -q 'voxtral-model-id' "$SCRIPT_DIR/install-local.sh" && echo yes || echo no)"
 
 check "Ogma.swift: dictionary editor in the menu" \
     "yes" "$(grep -q 'func editDictionary' "$SETTINGS_SWIFT" && \
@@ -2156,14 +2369,11 @@ section "Per-backend speed"
 check "speak.sh: LOCAL_SPEED variable defined" \
     "yes" "$(grep -q 'LOCAL_SPEED=' "$SPEAK_SH" && echo "yes" || echo "no")"
 
-check "speak.sh: LOCAL_SPEED env var saved before config sourcing" \
-    "yes" "$(grep -q '_ENV_LOCAL_SPEED=' "$SPEAK_SH" && echo "yes" || echo "no")"
+check "speak.sh: LOCAL_SPEED environment has priority without sourcing config" \
+    "yes" "$(grep -q 'LOCAL_SPEED="${LOCAL_SPEED:-\$(_config_value LOCAL_SPEED)}"' "$SPEAK_SH" && echo "yes" || echo "no")"
 
-check "speak.sh: LOCAL_SPEED restored with env var priority" \
-    "yes" "$(grep -q '_ENV_LOCAL_SPEED:-' "$SPEAK_SH" && echo "yes" || echo "no")"
-
-check "speak.sh: SPEED env var saved before config sourcing" \
-    "yes" "$(grep -q '_ENV_SPEED=' "$SPEAK_SH" && echo "yes" || echo "no")"
+check "speak.sh: SPEED environment has priority without sourcing config" \
+    "yes" "$(grep -q 'SPEED="${SPEED:-\$(_config_value SPEED)}"' "$SPEAK_SH" && echo "yes" || echo "no")"
 
 check "speak.sh: local TTS uses LOCAL_SPEED" \
     "yes" "$(grep -q '_SPEED=\"\$LOCAL_SPEED\"' "$SPEAK_SH" && echo "yes" || echo "no")"
@@ -3909,7 +4119,10 @@ trap cleanup EXIT INT TERM
 echo "PLAY" >> "$_SIMDIR/play.log"
 sleep 30 &
 _BG=$!
-sleep 30   # simulate blocking API call
+# A short polling wait makes SIGTERM observable by bash. A foreground `sleep`
+# can defer the trap long enough for the toggle forced-kill fallback, which
+# turns this into a test of scheduler timing rather than cleanup behavior.
+while kill -0 "$_BG" 2>/dev/null; do sleep 0.05; done
 wait "$_BG" 2>/dev/null || true
 INNER
 chmod +x "$_SIMDIR/sim_slow.sh"
@@ -3944,7 +4157,8 @@ grep -q CLEANUP "$_LOG" 2>/dev/null && echo "cleanup:yes" || echo "cleanup:no"
 [ -f "$_PID" ] && echo "pidfile:exists" || echo "pidfile:gone"
 
 wait "$_SLOW" 2>/dev/null
-' _ "$_SIMDIR" > "$_SIMDIR/result" 2>/dev/null
+exit 0
+' _ "$_SIMDIR" > "$_SIMDIR/result" 2>/dev/null || true
 
 check "sim-toggle: target process is dead" \
     "yes" "$(grep -q 'target:dead' "$_SIMDIR/result" && echo "yes" || echo "no")"
@@ -3981,7 +4195,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 echo "START:$$" >> "$_SIMDIR/play.log"
 sleep 30 &
-wait $! 2>/dev/null || true
+_VOICE_CHILD=$!
+# Poll so TERM is handled promptly instead of being deferred behind a
+# foreground wait on macOS bash 3.2.
+while kill -0 "$_VOICE_CHILD" 2>/dev/null; do sleep 0.05; done
+wait "$_VOICE_CHILD" 2>/dev/null || true
 echo "END:$$" >> "$_SIMDIR/play.log"
 INNER
 chmod +x "$_SIMDIR/sim_voice.sh"
@@ -4020,7 +4238,8 @@ PIDVAL=$(cat "$_PID" 2>/dev/null)
 
 # Cleanup
 kill "$C" 2>/dev/null; wait "$C" 2>/dev/null; wait "$A" 2>/dev/null
-' _ "$_SIMDIR" > "$_SIMDIR/result" 2>/dev/null
+exit 0
+' _ "$_SIMDIR" > "$_SIMDIR/result" 2>/dev/null || true
 
 check "sim-overlap: instance A is dead" \
     "yes" "$(grep -q 'a:dead' "$_SIMDIR/result" && echo "yes" || echo "no")"
@@ -4100,7 +4319,7 @@ STUB
 chmod +x "$_STUBS"/*
 
 check_exit "429 + install-local + local TTS succeeds → exits 0" 0 \
-    bash -c 'echo "hello" | env PATH="'"$_STUBS"':$PATH" VENV_PYTHON="'"$_STUBS"'/python3" TTS_BACKEND=elevenlabs TTS_BACKENDS_INSTALLED=elevenlabs OGMA_NO_QUEUE_PLAYER=1 bash "'"$SPEAK_SH"'"'
+    bash -c 'echo "hello" | env PATH="'"$_STUBS"':$PATH" TMPDIR="'"$_STUBS"'" VENV_PYTHON="'"$_STUBS"'/python3" TTS_BACKEND=elevenlabs TTS_BACKENDS_INSTALLED=elevenlabs OGMA_NO_QUEUE_PLAYER=1 bash "'"$SPEAK_SH"'"'
 
 rm -rf "$_STUBS"
 

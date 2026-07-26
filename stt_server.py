@@ -47,6 +47,33 @@ CONFIG_FILE = (os.path.join(DATA_DIR, "config") if _data_dir_override
 # The Parakeet model to load.  Override with the STT_MODEL env var.
 MODEL_ID = os.environ.get("STT_MODEL", "mlx-community/parakeet-tdt-0.6b-v2")
 
+
+def _config_value(key):
+    """Read a value from the shell config file, or None.  Matches the key
+    exactly (STT_ENGINE must not match STT_ENGINES_INSTALLED)."""
+    try:
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                k, eq, v = line.strip().partition("=")
+                if eq and k.strip() == key:
+                    return v.strip().strip("\"'")
+    except OSError:
+        pass
+    return None
+
+
+# Dictation engine. "parakeet" is the default; "voxtral" loads Voxtral Realtime
+# 4B through mlx-audio and uses its stateful streaming session for both partials
+# and finals. Resolved once at startup: the menu app kills the daemon on engine
+# change, so a live re-read would only invite a half-switched state. Keep the
+# model repo id in sync with install-local.sh.
+VOXTRAL_MODEL_ID = os.environ.get("STT_VOXTRAL_MODEL",
+                                  "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit")
+ENGINE = (os.environ.get("STT_ENGINE") or _config_value("STT_ENGINE")
+          or "parakeet").lower()
+if ENGINE not in ("parakeet", "voxtral"):
+    ENGINE = "parakeet"
+
 # Leading silence (seconds) prepended to a stream before the user's first
 # audio.  Streaming ASR decodes the first word much more reliably with a bit
 # of leading context than when speech starts at the very edge of the buffer —
@@ -62,24 +89,12 @@ DEFAULT_IDLE_TIMEOUT = 120
 MIN_IDLE_TIMEOUT = 5
 
 
-def _config_idle_timeout():
-    """Read STT_IDLE_TIMEOUT from the shell config file, or None."""
-    try:
-        with open(CONFIG_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("STT_IDLE_TIMEOUT"):
-                    return line.split("=", 1)[1].strip().strip("\"'")
-    except OSError:
-        pass
-    return None
-
-
 def effective_timeout():
     """Idle timeout in seconds.  Priority: STT_IDLE_TIMEOUT in the config file
     (menu-driven, applied live), then the STT_IDLE_TIMEOUT env var, then the
     default."""
-    for source in (_config_idle_timeout(), os.environ.get("STT_IDLE_TIMEOUT")):
+    for source in (_config_value("STT_IDLE_TIMEOUT"),
+                   os.environ.get("STT_IDLE_TIMEOUT")):
         try:
             v = int(source)
             if v >= MIN_IDLE_TIMEOUT:
@@ -106,6 +121,7 @@ def log(msg):
 # ── Globals ──────────────────────────────────────────────────────────
 
 model = None
+voxtral = None            # mlx-audio Voxtral model when the engine is up
 last_request_time = time.time()
 server_socket = None
 shutdown_event = threading.Event()
@@ -119,7 +135,8 @@ def write_state():
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"idle_timeout": effective_timeout(),
-                       "last_request": last_request_time}, f)
+                       "last_request": last_request_time,
+                       "engine": ENGINE if voxtral is not None else "parakeet"}, f)
         os.replace(tmp, STATE_FILE)
     except OSError:
         pass
@@ -129,13 +146,64 @@ def write_state():
 
 
 def load_stt_model():
-    """Load the Parakeet model into memory."""
-    global model
+    """Load the selected engine.  Only ONE model is resident: Voxtral serves
+    both live partials and finals when selected (Parakeet stays on disk as
+    the fallback and loads instead only if Voxtral can't)."""
+    global model, voxtral
+
+    if ENGINE == "voxtral":
+        try:
+            # Only load from the local cache — from_pretrained would otherwise
+            # start a 3 GB download inside a GUI-launched daemon.
+            from huggingface_hub import try_to_load_from_cache
+            if try_to_load_from_cache(VOXTRAL_MODEL_ID, "config.json") is None:
+                raise RuntimeError("model not cached; re-run install-local.sh --with-voxtral")
+            from mlx_audio.stt.utils import load as load_voxtral
+            log(f"loading voxtral {VOXTRAL_MODEL_ID}")
+            voxtral = load_voxtral(VOXTRAL_MODEL_ID)
+            log("voxtral loaded")
+            return
+        except Exception as e:
+            voxtral = None
+            log(f"voxtral unavailable, falling back to parakeet: {e}")
+
     from parakeet_mlx import from_pretrained
 
     log(f"loading model {MODEL_ID}")
     model = from_pretrained(MODEL_ID)
     log("model loaded")
+
+
+def voxtral_transcribe(samples, sample_rate=16000):
+    """Batch-decode a full utterance with Voxtral Realtime 4B.
+
+    samples: float32 mono numpy array.  Returns the transcript text —
+    punctuated and cased by the LLM decoder, no per-word confidences.
+    """
+    import numpy as np
+
+    import mlx.core as mx
+    # Same onset problem LEAD_SILENCE_SEC solves for Parakeet: with speech
+    # starting at the very edge of the buffer, Voxtral drops the opening
+    # sentence.  Half a second of leading silence reliably fixes it.
+    samples = np.concatenate(
+        [np.zeros(int(0.5 * sample_rate), dtype=np.float32), samples])
+    # Generous token budget: ~15 tokens/s of audio covers fast speech with
+    # punctuation several times over.
+    max_new = max(256, min(4096, int(len(samples) / sample_rate * 15)))
+    out = voxtral.generate([mx.array(samples)], max_tokens=max_new,
+                           temperature=0.0, transcription_delay_ms=480)
+    return out.text.strip()
+
+
+def words_from_text(text):
+    """Word list for an engine that gives no per-word confidences.  Same
+    "join reproduces text" invariant as words_from_result; confidence 1.0
+    means the suggestion machinery leaves these words alone."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    return [{"text": w, "confidence": 1.0} for w in text.split(" ")]
 
 
 def warmup():
@@ -148,7 +216,15 @@ def warmup():
         log("warming up")
         tmp = os.path.join(tempfile.mkdtemp(prefix="ogma_stt_warm_"), "s.wav")
         sf.write(tmp, np.zeros(16000, dtype="float32"), 16000)
-        transcribe_file(tmp)
+        if voxtral is not None:
+            voxtral_transcribe(np.zeros(16000, dtype="float32"))
+        else:
+            transcribe_file(tmp)
+        # Drop the warmup's cached buffers: MLX's allocator fragments badly
+        # when the first decode is tiny and the next is 30× larger — measured
+        # 47s instead of 2s for the first real Voxtral request without this.
+        import mlx.core as mx
+        mx.clear_cache()
         try:
             os.unlink(tmp)
             os.rmdir(os.path.dirname(tmp))
@@ -216,15 +292,9 @@ _PUNCT = ".,!?;:'\""
 
 
 def filter_fillers_enabled():
-    try:
-        with open(CONFIG_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("FILTER_FILLERS"):
-                    v = line.split("=", 1)[1].strip().strip("\"'").lower()
-                    return v not in ("false", "0", "no", "off")
-    except OSError:
-        pass
+    v = _config_value("FILTER_FILLERS")
+    if v is not None:
+        return v.lower() not in ("false", "0", "no", "off")
     return True
 
 
@@ -514,28 +584,35 @@ def add_suggestions(words):
     return words
 
 
-def transcribe_file(audio_file):
-    """Transcribe an audio file and return the AlignedResult.
+def read_audio(audio_file):
+    """Decode an audio file to float32 mono samples at the model's rate.
 
-    We decode with soundfile and feed samples straight to the model instead
-    of calling model.transcribe(), which shells out to ffmpeg.  ffmpeg is not
-    on the restricted PATH of a GUI-launched daemon, and avoiding it removes a
-    dependency.  Ogma records 16 kHz mono WAV (the model's native rate), so
-    normally there is no resampling.
+    We decode with soundfile instead of shelling out to ffmpeg — ffmpeg is
+    not on the restricted PATH of a GUI-launched daemon, and avoiding it
+    removes a dependency.  Ogma records 16 kHz mono WAV (the model's native
+    rate), so normally there is no resampling.
     """
-    import mlx.core as mx
     import numpy as np
     import soundfile as sf
-    from parakeet_mlx.audio import get_logmel
 
     samples, sr = sf.read(audio_file, dtype="float32", always_2d=False)
     if getattr(samples, "ndim", 1) > 1:      # stereo → mono
         samples = samples.mean(axis=1)
-    target_sr = model.preprocessor_config.sample_rate
+    target_sr = (model.preprocessor_config.sample_rate
+                 if model is not None else 16000)
     if sr != target_sr:
         import librosa
         samples = librosa.resample(samples, orig_sr=sr, target_sr=target_sr)
-    mel = get_logmel(mx.array(samples.astype(np.float32)), model.preprocessor_config)
+    return samples.astype(np.float32), target_sr
+
+
+def transcribe_file(audio_file):
+    """Transcribe an audio file with Parakeet and return the AlignedResult."""
+    import mlx.core as mx
+    from parakeet_mlx.audio import get_logmel
+
+    samples, _ = read_audio(audio_file)
+    mel = get_logmel(mx.array(samples), model.preprocessor_config)
     return model.generate(mel)[0]
 
 
@@ -658,10 +735,132 @@ def handle_stream(conn, request, initial=b""):
             add_suggestions(final_words)
 
     conn.sendall((json.dumps({"status": "ok", "final": final,
-                              "words": final_words}) + "\n").encode())
+                              "words": final_words,
+                              "model": MODEL_ID.rsplit("/", 1)[-1]}) + "\n").encode())
     last_request_time = time.time()
     write_state()
     log(f"stream final: {len(final)} chars")
+
+
+def handle_stream_voxtral(conn, request, initial=b""):
+    """Stateful, linear-time streaming transcription with Voxtral.
+
+    mlx-audio incrementally caches mel features, audio-encoder state, and the
+    decoder KV state. Detailed mode receives full partial transcripts. None and
+    Simple still advance the same final transcription while recording, but do
+    so silently with the high-quality 2400 ms delay preset. Closing the stream
+    only drains the remaining cached tail; it never re-decodes the utterance.
+    """
+    global last_request_time
+    import numpy as np
+
+    sr = int(request.get("sample_rate", 16000))
+    target_sr = 16000
+    want_partials = request.get("want_partials", True) is not False
+    delay_ms = 480 if want_partials else 2400
+    log(f"stream start (voxtral, sr={sr}, partials={want_partials}, "
+        f"delay={delay_ms}ms)")
+
+    buf = bytearray(initial)
+    session = voxtral.create_streaming_session(
+        max_tokens=4096, temperature=0.0, transcription_delay_ms=delay_ms)
+    transcript_parts = []
+    total_samples = 0
+    ended = False
+
+    def recv_into_buf(timeout):
+        """One recv into buf.  True = got data, None = nothing yet, False = EOF."""
+        conn.settimeout(timeout)
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            return None
+        if not chunk:
+            return False
+        buf.extend(chunk)
+        return True
+
+    def pop_frames():
+        """Feed all complete wire frames into the stateful session."""
+        nonlocal total_samples, ended
+        while True:
+            if len(buf) < 4:
+                return
+            (n,) = struct.unpack(">I", bytes(buf[:4]))
+            if n == 0:
+                del buf[:4]
+                ended = True
+                return
+            if len(buf) < 4 + n:
+                return
+            payload = bytes(buf[4:4 + n])
+            del buf[:4 + n]
+            samples = np.frombuffer(payload, dtype="<f4")
+            if sr != target_sr:
+                import librosa
+                samples = librosa.resample(
+                    samples.astype(np.float32), orig_sr=sr, target_sr=target_sr)
+            samples = samples.astype(np.float32)
+            session.feed(samples)
+            total_samples += len(samples)
+
+    def output_view(raw_text):
+        """Apply output-only cleanup without changing the session's token state."""
+        text = raw_text.strip()
+        words = words_from_text(text)
+        if filter_fillers_enabled():
+            words = strip_fillers(words)
+            text = " ".join(w["text"] for w in words)
+        return text, words
+
+    def advance(max_decode_tokens, emit_partial):
+        """Run one bounded unit of cached MLX work and optionally publish it."""
+        deltas = session.step(max_decode_tokens=max_decode_tokens)
+        if not deltas:
+            return
+        transcript_parts.extend(deltas)
+        if emit_partial:
+            text, words = output_view("".join(transcript_parts))
+            conn.settimeout(30)
+            conn.sendall((json.dumps(
+                {"partial": text, "words": words}) + "\n").encode())
+
+    pop_frames()                 # complete frames may already be in `initial`
+    last_audio_at = time.monotonic()
+
+    with transcribe_lock:
+        while not shutdown_event.is_set() and not ended:
+            got = recv_into_buf(0.1)
+            if got is False:
+                log("voxtral stream: client disconnected")
+                return
+            if got is not None:
+                pop_frames()
+                last_audio_at = time.monotonic()
+                last_request_time = time.time()
+            elif time.monotonic() - last_audio_at > 60:
+                log("voxtral stream: 60s idle, finalizing")
+                break
+            advance(max_decode_tokens=16, emit_partial=want_partials)
+
+        session.close()
+        drain_started = time.monotonic()
+        while not session.done:
+            if time.monotonic() - drain_started > 60:
+                raise TimeoutError("Voxtral streaming finalization timed out")
+            advance(max_decode_tokens=64, emit_partial=False)
+
+    final, final_words = output_view("".join(transcript_parts))
+
+    conn.settimeout(30)
+    conn.sendall((json.dumps(
+        {"status": "ok", "final": final, "words": final_words,
+         "model": VOXTRAL_MODEL_ID.rsplit("/", 1)[-1]}) + "\n").encode())
+    last_request_time = time.time()
+    write_state()
+    log(f"stream final (voxtral): {len(final)} chars, "
+        f"{total_samples/target_sr:.1f}s audio, "
+        f"{time.monotonic()-drain_started:.2f}s tail")
 
 
 def handle_client(conn):
@@ -685,7 +884,10 @@ def handle_client(conn):
         request = json.loads(line.decode("utf-8").strip())
 
         if request.get("mode") == "stream":
-            handle_stream(conn, request, rest)
+            if voxtral is not None:
+                handle_stream_voxtral(conn, request, rest)
+            else:
+                handle_stream(conn, request, rest)
             return
 
         audio_file = request.get("audio_file", "")
@@ -693,15 +895,29 @@ def handle_client(conn):
             raise FileNotFoundError(f"audio file not found: {audio_file!r}")
 
         log(f"request: {audio_file}")
+        response_model = MODEL_ID.rsplit("/", 1)[-1]
         with transcribe_lock:
-            result = transcribe_file(audio_file)
+            words = None
+            if voxtral is not None:
+                try:
+                    samples, target_sr = read_audio(audio_file)
+                    words = words_from_text(voxtral_transcribe(samples, target_sr))
+                    response_model = VOXTRAL_MODEL_ID.rsplit("/", 1)[-1]
+                except Exception as e:
+                    log(f"voxtral one-shot failed: {e}")
+                    words = None
+            if words is None:
+                if model is None:
+                    raise RuntimeError("voxtral transcription failed")
+                words = words_from_result(transcribe_file(audio_file))
 
-        words = words_from_result(result)
         if filter_fillers_enabled():
             words = strip_fillers(words)
+        text = " ".join(w["text"] for w in words)
         response = json.dumps({"status": "ok",
-                               "text": " ".join(w["text"] for w in words),
-                               "words": add_suggestions(words)})
+                               "text": text,
+                               "words": add_suggestions(words),
+                               "model": response_model})
         conn.sendall((response + "\n").encode("utf-8"))
         log(f"response: {len(text)} chars")
 

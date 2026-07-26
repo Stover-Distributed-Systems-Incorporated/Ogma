@@ -12,37 +12,63 @@
 
 # ── Configuration ──────────────────────────────────────────────────
 
-# Save env vars before sourcing config (source overwrites same-named vars).
-_ENV_TTS_BACKEND="${TTS_BACKEND:-}"
-_ENV_TTS_BACKENDS_INSTALLED="${TTS_BACKENDS_INSTALLED:-}"
-_ENV_LOCAL_VOICE="${LOCAL_VOICE:-}"
-_ENV_LOCAL_SPEED="${LOCAL_SPEED:-}"
-_ENV_SPEED="${SPEED:-}"
-_ENV_SENTENCE_PAUSE="${SENTENCE_PAUSE:-}"
-
-# Load settings written by the menu bar settings app.
+# Read settings written by the menu bar without executing the file. The config
+# is user-editable, so `source` would turn a voice ID or a comment into shell
+# code. This deliberately supports only plain KEY=value entries.
 _CONFIG="$HOME/.config/ogma/config"
-[ -f "$_CONFIG" ] && source "$_CONFIG"
+_config_value() {
+    local wanted="$1" line key value
+    [ -r "$_CONFIG" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -n "$line" ] && [ "${line#\#}" = "$line" ] && [ "${line#*=}" != "$line" ] || continue
+        key="${line%%=*}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [ "$key" = "$wanted" ] || continue
+        value="${line#*=}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+        esac
+        printf '%s' "$value"
+        return 0
+    done < "$_CONFIG"
+}
 
 # Priority: environment variable > config file > hardcoded default.
-TTS_BACKEND="${_ENV_TTS_BACKEND:-${TTS_BACKEND:-auto}}"
-TTS_BACKENDS_INSTALLED="${_ENV_TTS_BACKENDS_INSTALLED:-${TTS_BACKENDS_INSTALLED:-elevenlabs}}"
-LOCAL_VOICE="${_ENV_LOCAL_VOICE:-${LOCAL_VOICE:-bf_lily}}"
+TTS_BACKEND="${TTS_BACKEND:-$(_config_value TTS_BACKEND)}"
+TTS_BACKEND="${TTS_BACKEND:-auto}"
+TTS_BACKENDS_INSTALLED="${TTS_BACKENDS_INSTALLED:-$(_config_value TTS_BACKENDS_INSTALLED)}"
+TTS_BACKENDS_INSTALLED="${TTS_BACKENDS_INSTALLED:-elevenlabs}"
+LOCAL_VOICE="${LOCAL_VOICE:-$(_config_value LOCAL_VOICE)}"
+LOCAL_VOICE="${LOCAL_VOICE:-bf_lily}"
 
 # ElevenLabs settings (loaded when needed — both "elevenlabs" and "auto" modes)
 if [ "$TTS_BACKEND" = "elevenlabs" ] || [ "$TTS_BACKEND" = "auto" ]; then
     ELEVENLABS_API_KEY="${ELEVENLABS_API_KEY:-$(security find-generic-password -a "ogma" -s "ogma-api-key" -w 2>/dev/null)}"
-    VOICE_ID="${ELEVENLABS_VOICE_ID:-${VOICE_ID:-pFZP5JQG7iQjIQuC4Bku}}"
-    MODEL_ID="${ELEVENLABS_MODEL_ID:-${MODEL_ID:-eleven_flash_v2_5}}"
+    VOICE_ID="${ELEVENLABS_VOICE_ID:-${VOICE_ID:-$(_config_value VOICE_ID)}}"
+    VOICE_ID="${VOICE_ID:-pFZP5JQG7iQjIQuC4Bku}"
+    MODEL_ID="${ELEVENLABS_MODEL_ID:-${MODEL_ID:-$(_config_value MODEL_ID)}}"
+    MODEL_ID="${MODEL_ID:-eleven_flash_v2_5}"
+    STABILITY="${STABILITY:-$(_config_value STABILITY)}"
     STABILITY="${STABILITY:-0.5}"
+    SIMILARITY_BOOST="${SIMILARITY_BOOST:-$(_config_value SIMILARITY_BOOST)}"
     SIMILARITY_BOOST="${SIMILARITY_BOOST:-0.75}"
+    STYLE="${STYLE:-$(_config_value STYLE)}"
     STYLE="${STYLE:-0.0}"
+    USE_SPEAKER_BOOST="${USE_SPEAKER_BOOST:-$(_config_value USE_SPEAKER_BOOST)}"
     USE_SPEAKER_BOOST="${USE_SPEAKER_BOOST:-true}"
 fi
 
-SPEED="${_ENV_SPEED:-${SPEED:-1.0}}"
-LOCAL_SPEED="${_ENV_LOCAL_SPEED:-${LOCAL_SPEED:-1.0}}"
-SENTENCE_PAUSE="${_ENV_SENTENCE_PAUSE:-${SENTENCE_PAUSE:-400}}"
+SPEED="${SPEED:-$(_config_value SPEED)}"
+SPEED="${SPEED:-1.0}"
+LOCAL_SPEED="${LOCAL_SPEED:-$(_config_value LOCAL_SPEED)}"
+LOCAL_SPEED="${LOCAL_SPEED:-1.0}"
+SENTENCE_PAUSE="${SENTENCE_PAUSE:-$(_config_value SENTENCE_PAUSE)}"
+SENTENCE_PAUSE="${SENTENCE_PAUSE:-400}"
 
 # ── Validate numeric config values ───────────────────────────────
 # Prevents malformed JSON if config is manually edited with bad values.

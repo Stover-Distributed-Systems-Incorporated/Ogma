@@ -10,10 +10,45 @@ import ServiceManagement
 private let configDir  = (NSHomeDirectory() as NSString).appendingPathComponent(".config/ogma")
 private let configPath = (configDir as NSString).appendingPathComponent("config")
 private let speakPath  = (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/speak.sh")
+private let voxtralModelId = "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
+
+// NSPasteboardItem is not NSCopying even though it inherits NSObject. Calling
+// copy() therefore raises an Objective-C exception at runtime. Materialize each
+// declared representation into a new item so the clipboard can be restored
+// safely after a successful synthetic paste.
+private func snapshotPasteboardItems(_ items: [NSPasteboardItem]) -> [NSPasteboardItem] {
+    items.compactMap { source in
+        let snapshot = NSPasteboardItem()
+        var copiedRepresentation = false
+        for type in source.types {
+            if let data = source.data(forType: type) {
+                _ = snapshot.setData(data, forType: type)
+                copiedRepresentation = true
+            }
+        }
+        return copiedRepresentation ? snapshot : nil
+    }
+}
+
+private func runPasteboardSnapshotSelfTest() -> Bool {
+    let source = NSPasteboardItem()
+    let binaryType = NSPasteboard.PasteboardType("com.ogma.self-test.binary")
+    let binaryValue = Data([0x00, 0x01, 0x7f, 0xff])
+    _ = source.setString("Ogma clipboard test", forType: .string)
+    _ = source.setData(binaryValue, forType: binaryType)
+
+    let snapshots = snapshotPasteboardItems([source])
+    guard snapshots.count == 1, snapshots[0] !== source else { return false }
+    return snapshots[0].string(forType: .string) == "Ogma clipboard test"
+        && snapshots[0].data(forType: binaryType) == binaryValue
+}
 
 // MARK: - Config model
 
 struct Config {
+    // Keep comments and settings owned by other helpers (for example
+    // FILTER_FILLERS) when the menu writes its own settings back out.
+    private var preservedLines: [String] = []
     // Backend selection
     var ttsBackend:         String = "auto"          // "auto", "elevenlabs", or "local"
     var backendsInstalled:  String = "elevenlabs"   // "elevenlabs", "local", or "both"
@@ -32,13 +67,18 @@ struct Config {
     var localIdleTimeout: Int   = 120   // seconds before the TTS model unloads
     var sttIdleTimeout:   Int   = 120   // seconds before the STT model unloads
 
+    // Dictation engine: "parakeet" (fast, streaming) or "voxtral" (Voxtral
+    // Realtime 4B — LLM decoder with better grammar and punctuation).
+    var sttEngine:           String = "parakeet"
+    var sttEnginesInstalled: String = "parakeet"    // "parakeet" or "both"
+
     // Dictation: show the review card (✓ insert / ✎ edit / ✗ discard) instead
     // of pasting the transcript immediately when recording stops.
     var dictationReview: Bool   = true
 
-    // Opt-in: share dictation corrections (text only, never audio) with
-    // Stover Distributed to improve recognition. Default off.
-    var shareCorrections: Bool  = false
+    // Live recording presentation: "none" (menu-bar waveform only), "simple"
+    // (compact audio meter), or "detailed" (live transcript card).
+    var recordingIndicator: String = "detailed"
 
     // ElevenLabs speed (shared name kept for config compat)
     var speed:           Double = 1.0
@@ -46,13 +86,25 @@ struct Config {
     // Inter-sentence pause (milliseconds at 1.0x speed, scales with speed)
     var sentencePause:   Int    = 400
 
+    // Speed reader (RSVP): words per minute. Swift-only feature — other config
+    // readers (speak.sh, the daemons) ignore this key.
+    var wpm:             Int    = 300
+
+    // Speed reader: also play per-word Kokoro TTS synced to the flash rate.
+    // Experimental — the audio is pre-generated at 2× and cut short by the
+    // visual timer. Local (Kokoro) only. Swift-only key.
+    var speedReadAudio:  Bool   = false
+
     static func load() -> Config {
         var c = Config()
         guard let raw = try? String(contentsOfFile: configPath, encoding: .utf8) else { return c }
-        for line in raw.components(separatedBy: .newlines) {
-            let line = line.trimmingCharacters(in: .whitespaces)
+        for originalLine in raw.components(separatedBy: .newlines) {
+            let line = originalLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty, !line.hasPrefix("#"),
-                  let eqRange = line.range(of: "=") else { continue }
+                  let eqRange = line.range(of: "=") else {
+                c.preservedLines.append(originalLine)
+                continue
+            }
             let key = String(line[line.startIndex..<eqRange.lowerBound])
                 .trimmingCharacters(in: .whitespaces)
             var value = String(line[eqRange.upperBound...])
@@ -76,10 +128,20 @@ struct Config {
             case "LOCAL_SPEED":          c.localSpeed         = Double(value) ?? c.localSpeed
             case "LOCAL_IDLE_TIMEOUT":   c.localIdleTimeout   = Int(value) ?? c.localIdleTimeout
             case "STT_IDLE_TIMEOUT":     c.sttIdleTimeout     = Int(value) ?? c.sttIdleTimeout
+            case "STT_ENGINE":           c.sttEngine          = value
+            case "STT_ENGINES_INSTALLED": c.sttEnginesInstalled = value
             case "DICTATION_REVIEW":     c.dictationReview    = value != "false" && value != "0"
-            case "SHARE_CORRECTIONS":    c.shareCorrections   = value == "true" || value == "1"
+            case "RECORDING_INDICATOR":
+                if ["none", "simple", "detailed"].contains(value) {
+                    c.recordingIndicator = value
+                }
+            // Removed local-corrections sharing setting. Recognize the legacy
+            // key so Config.save() drops it instead of preserving it.
+            case "SHARE_CORRECTIONS":    break
             case "SENTENCE_PAUSE":       c.sentencePause      = Int(value) ?? c.sentencePause
-            default: break
+            case "WPM":                  c.wpm                = Int(value) ?? c.wpm
+            case "SPEED_READ_AUDIO":     c.speedReadAudio     = value == "true" || value == "1"
+            default:                     c.preservedLines.append(originalLine)
             }
         }
         return c
@@ -102,11 +164,25 @@ struct Config {
             "LOCAL_SPEED=\"\(String(format: "%.2f", localSpeed))\"",
             "LOCAL_IDLE_TIMEOUT=\"\(localIdleTimeout)\"",
             "STT_IDLE_TIMEOUT=\"\(sttIdleTimeout)\"",
+            "STT_ENGINE=\"\(sttEngine)\"",
+            "STT_ENGINES_INSTALLED=\"\(sttEnginesInstalled)\"",
             "DICTATION_REVIEW=\"\(dictationReview ? "true" : "false")\"",
-            "SHARE_CORRECTIONS=\"\(shareCorrections ? "true" : "false")\"",
+            "RECORDING_INDICATOR=\"\(recordingIndicator)\"",
             "SENTENCE_PAUSE=\"\(sentencePause)\"",
+            "WPM=\"\(wpm)\"",
+            "SPEED_READ_AUDIO=\"\(speedReadAudio ? "true" : "false")\"",
         ]
-        try? (lines.joined(separator: "\n") + "\n")
+        var output = lines
+        let preserved = preservedLines
+            .drop(while: { $0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .reversed()
+            .drop(while: { $0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .reversed()
+        if !preserved.isEmpty {
+            output.append("")
+            output.append(contentsOf: preserved)
+        }
+        try? (output.joined(separator: "\n") + "\n")
             .write(toFile: configPath, atomically: true, encoding: .utf8)
     }
 }
@@ -229,6 +305,8 @@ func unmuteOutput() {
 private let kHotkeyCode: Int64 = 44
 // Keycode 2 = "D" → ⌥⇧D toggles push-to-talk dictation (Parakeet STT).
 private let kDictateHotkeyCode: Int64 = 2
+// Keycode 15 = "R" → ⌥⇧R speed-reads (RSVP) the selection in a floating overlay.
+private let kSpeedReadHotkeyCode: Int64 = 15
 
 // Module-level tap reference so the C callback can re-enable it after a timeout.
 private var globalTap: CFMachPort?
@@ -254,7 +332,7 @@ private let hotkeyCallback: CGEventTapCallBack = { _, type, event, _ in
     let flags = event.flags.intersection([.maskAlternate, .maskShift, .maskControl, .maskCommand])
 
     guard flags == [.maskAlternate, .maskShift],
-          code == kHotkeyCode || code == kDictateHotkeyCode else {
+          code == kHotkeyCode || code == kDictateHotkeyCode || code == kSpeedReadHotkeyCode else {
         lastUserKeyDownAt = CFAbsoluteTimeGetCurrent()
         return Unmanaged.passRetained(event)
     }
@@ -266,6 +344,8 @@ private let hotkeyCallback: CGEventTapCallBack = { _, type, event, _ in
     DispatchQueue.global(qos: .userInitiated).async {
         if code == kDictateHotkeyCode {
             appDelegateRef?.handleDictateHotkey()
+        } else if code == kSpeedReadHotkeyCode {
+            appDelegateRef?.handleSpeedReadHotkey()
         } else {
             appDelegateRef?.handleHotkey()
         }
@@ -303,7 +383,7 @@ final class STTStreamClient {
     // daemon with a dead stream.
     var isClosed: Bool { sendQueue.sync { closed } }
 
-    func connect(socketPath: String, sampleRate: Int) -> Bool {
+    func connect(socketPath: String, sampleRate: Int, wantsPartials: Bool) -> Bool {
         let s = socket(AF_UNIX, SOCK_STREAM, 0)
         guard s >= 0 else { return false }
         // Without this, a daemon dying mid-stream (e.g. unloaded from the
@@ -333,7 +413,8 @@ final class STTStreamClient {
         sendQueue.sync {
             guard !self.closed else { Darwin.close(s); return }
             self.fd = s
-            let header = "{\"mode\":\"stream\",\"sample_rate\":\(sampleRate)}\n"
+            let header = "{\"mode\":\"stream\",\"sample_rate\":\(sampleRate),"
+                + "\"want_partials\":\(wantsPartials)}\n"
             _ = self.writeAll(Data(header.utf8))
             for f in self.pending { _ = self.writeAll(f) }
             self.pending.removeAll()
@@ -423,7 +504,9 @@ final class STTStreamClient {
                         return STTWord(text: t, confidence: c,
                                        suggestion: w["suggestion"] as? String)
                     } ?? []
-                    if let f = obj["final"] as? String { self?.onFinal?(f, words) }
+                    if let f = obj["final"] as? String {
+                        self?.onFinal?(f, words)
+                    }
                     else if let p = obj["partial"] as? String { self?.onPartial?(p, words) }
                 }
             }
@@ -564,11 +647,6 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     var onInsert: ((String) -> Void)?
     var onDiscard: (() -> Void)?
 
-    // Model output for the current review session, kept pristine while the
-    // user edits the card — the opt-in corrections log diffs against this.
-    private(set) var reviewOriginalText = ""
-    private(set) var reviewOriginalWords: [STTWord] = []
-
     // MARK: Live dictation — the card IS the recording view
 
     // ⌥⇧D from idle: show the card immediately, with partials streaming into
@@ -645,8 +723,6 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             panel.allowsKey = true
             panel.ignoresMouseEvents = false
             panel.makeFirstResponder(nil)   // text view starts unfocused
-            self.reviewOriginalText = text
-            self.reviewOriginalWords = words
             self.setTranscript(text, words: words)
             if takeKey {
                 panel.makeKeyAndOrderFront(nil)
@@ -763,9 +839,6 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             let repl = self.attributed(text, words: words)
             tv.textStorage?.replaceCharacters(in: range, with: repl)
             tv.setSelectedRange(NSRange(location: range.location + repl.length, length: 0))
-            // Dictate-more extends the model output this session diffs against.
-            self.reviewOriginalText += (self.reviewOriginalText.isEmpty ? "" : " ") + text
-            self.reviewOriginalWords += words
             self.endCardDictation()
             self.relayout()
         }
@@ -1176,6 +1249,737 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     }
 }
 
+// MARK: - Speed reader (RSVP) — ported from the SpeedReader project
+//
+// Rapid Serial Visual Presentation: flash one word at a time so the eyes never
+// move. Ported natively from an old Java/Swing project (DisplayFrame +
+// TextPlayer + ArrayListConstructor), with its bugs fixed:
+//   • punctuation stays glued to its word instead of flashing on its own frame
+//   • pause resumes from the current word instead of restarting from zero
+//   • WPM input is validated and clamped
+// and an ORP (optimal recognition point) guide added on top.
+
+// Blocking one-shot request to the Kokoro TTS daemon: send one word, get back
+// the path to a generated WAV. Mirrors speak.sh's tts_daemon_request wire
+// format ({"text","voice","speed","lang_code"}\n → {"status":"ok",
+// "audio_file":"…"}\n). Returns nil on any failure. Call off the main thread.
+private func ttsRequestClip(text: String, voice: String, speed: String,
+                            lang: String, socketPath: String) -> String? {
+    let s = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard s >= 0 else { return nil }
+    defer { Darwin.close(s) }
+    var noSigpipe: Int32 = 1
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+    var tv = timeval(tv_sec: 60, tv_usec: 0)   // model cold-load can take a few seconds
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let cap = MemoryLayout.size(ofValue: addr.sun_path)
+    socketPath.withCString { cstr in
+        withUnsafeMutablePointer(to: &addr.sun_path) { sp in
+            sp.withMemoryRebound(to: CChar.self, capacity: cap) { dst in _ = strncpy(dst, cstr, cap - 1) }
+        }
+    }
+    let r = withUnsafePointer(to: &addr) { p in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+            Darwin.connect(s, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard r == 0 else { return nil }
+
+    // JSONSerialization escapes the word safely into the "text" field.
+    let payload: [String: String] = ["text": text, "voice": voice, "speed": speed, "lang_code": lang]
+    guard var data = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+    data.append(0x0A)   // newline terminator the daemon reads until
+    let sent = data.withUnsafeBytes { Darwin.send(s, $0.baseAddress, $0.count, 0) }
+    guard sent == data.count else { return nil }
+
+    var response = Data()
+    var buf = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let n = Darwin.recv(s, &buf, buf.count, 0)
+        if n <= 0 { break }
+        response.append(contentsOf: buf[0..<n])
+        if response.contains(0x0A) { break }
+    }
+    guard let obj = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+          (obj["status"] as? String) == "ok",
+          let file = obj["audio_file"] as? String,
+          FileManager.default.fileExists(atPath: file) else { return nil }
+    return file
+}
+
+// One-at-a-time word display with an ORP guide: each word is positioned so its
+// pivot letter sits on a fixed vertical line, and that letter is tinted red.
+// The eye lands in the same spot every word, which is what lets RSVP hit high
+// WPM. Draws itself directly so it stays aligned through window resizes.
+private final class RSVPDisplayView: NSView {
+    var token: String = "" { didSet { needsDisplay = true } }
+    var pivot: Int = 0
+    // False in the floating overlay so the HUD blur shows through the words.
+    var drawBackground = true
+    private let baseFont = NSFont(name: "Georgia", size: 64)
+        ?? NSFont.systemFont(ofSize: 64, weight: .medium)
+
+    // Standard ORP heuristic: the pivot drifts right as words get longer.
+    static func pivotIndex(forLength n: Int) -> Int {
+        switch n {
+        case 0...1:   return 0
+        case 2...5:   return 1
+        case 6...9:   return 2
+        case 10...13: return 3
+        default:      return 4
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if drawBackground {
+            NSColor.textBackgroundColor.setFill()
+            dirtyRect.fill()
+        }
+
+        let guideX = (bounds.width / 2).rounded()
+
+        // ORP guide: a faint vertical tick above and below the pivot column.
+        NSColor.separatorColor.setStroke()
+        let guide = NSBezierPath()
+        guide.lineWidth = 1
+        guide.move(to: NSPoint(x: guideX, y: bounds.height - 4))
+        guide.line(to: NSPoint(x: guideX, y: bounds.height - 20))
+        guide.move(to: NSPoint(x: guideX, y: 4))
+        guide.line(to: NSPoint(x: guideX, y: 20))
+        guide.stroke()
+
+        let chars = Array(token)
+        guard !chars.isEmpty else { return }
+
+        // Fit long words: shrink the font until the whole word fits the width.
+        var font = baseFont
+        let maxWidth = bounds.width - 24
+        while (token as NSString).size(withAttributes: [.font: font]).width > maxWidth,
+              font.pointSize > 14 {
+            font = NSFont(descriptor: font.fontDescriptor, size: font.pointSize - 2) ?? font
+        }
+
+        let p = min(max(pivot, 0), chars.count - 1)
+        let before  = String(chars[0..<p])
+        let pivotCh = String(chars[p])
+        let after   = p + 1 < chars.count ? String(chars[(p + 1)...]) : ""
+
+        let normal: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
+        let hot:    [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.systemRed]
+
+        let wBefore = (before  as NSString).size(withAttributes: normal).width
+        let wPivot  = (pivotCh as NSString).size(withAttributes: hot).width
+        let lineH   = (token   as NSString).size(withAttributes: normal).height
+        let baseY   = ((bounds.height - lineH) / 2).rounded()
+
+        // Position so the pivot glyph's center sits exactly on the guide.
+        let startX = guideX - wBefore - wPivot / 2
+        (before  as NSString).draw(at: NSPoint(x: startX,                    y: baseY), withAttributes: normal)
+        (pivotCh as NSString).draw(at: NSPoint(x: startX + wBefore,          y: baseY), withAttributes: hot)
+        (after   as NSString).draw(at: NSPoint(x: startX + wBefore + wPivot, y: baseY), withAttributes: normal)
+    }
+}
+
+// The speed-reader window: paste text, set WPM, Play/Pause. Merges the
+// original's three Swing frames (display, new-text, settings) into one window.
+private final class SpeedReadController: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+    private var display: RSVPDisplayView!
+    private var sourceText: NSTextView!
+    private var scroll: NSScrollView!
+    private var playPause: NSButton!
+    private var restart: NSButton!
+    private var wpmLabel: NSTextField!
+    private var wpmField: NSTextField!
+    private var wpmStepper: NSStepper!
+    private var progress: NSTextField!
+
+    private var audioCheck: NSButton!
+
+    private var tokens: [String] = []
+    private var index = 0
+    private var playing = false
+    private var preparing = false
+    private var preparationGeneration = 0
+    private var timer: Timer?
+    private var tokenizedFrom = ""   // source text the current tokens were built from
+
+    // Synced audio: one pre-generated WAV per token (nil = silent/punctuation),
+    // played on each flash and cut short by the visual timer. clipsFrom marks
+    // the source text they were built for, so we regenerate when it changes.
+    private var audioEnabled = false
+    private var clips: [String?] = []
+    private var clipsFrom = ""
+    private var clipPlayer: Process?
+
+    private(set) var wpm = 300
+    var onWpmChanged: ((Int) -> Void)?    // persist to config
+    var onAudioToggled: ((Bool) -> Void)? // persist to config
+    var onClose: (() -> Void)?            // restore .accessory activation policy
+
+    // Provided by the app: local Kokoro availability + the generator that turns
+    // tokens into WAV paths (progress = done/total; completion = clips or nil).
+    var audioAvailable = false
+    var generateClips: (([String], @escaping (Int, Int) -> Void, @escaping ([String?]?) -> Void) -> Void)?
+    var cancelClips: (() -> Void)?
+
+    // RSVP tokenizer. The original Java emitted every punctuation mark as its
+    // own frame (a lone "." would flash on screen); splitting on whitespace
+    // keeps punctuation glued to its word, which is what you want to read.
+    static func tokenize(_ text: String) -> [String] {
+        text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    }
+
+    private func clampWpm(_ n: Int) -> Int { max(30, min(1500, n)) }
+
+    func show(initialWpm: Int, audioOn: Bool) {
+        wpm = clampWpm(initialWpm)
+        audioEnabled = audioOn && audioAvailable
+        if window == nil { build() }
+        wpmField.stringValue = String(wpm)
+        wpmStepper.integerValue = wpm
+        audioCheck.state = audioEnabled ? .on : .off
+        audioCheck.isEnabled = audioAvailable
+        audioCheck.toolTip = audioAvailable
+            ? "Play per-word Kokoro audio synced to the flash rate (experimental)"
+            : "Requires local (Kokoro) TTS to be installed"
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeFirstResponder(sourceText)
+    }
+
+    // MARK: Building
+
+    private func build() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 470),
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                         backing: .buffered, defer: false)
+        w.title = "Speed Reader"
+        w.delegate = self
+        w.minSize = NSSize(width: 480, height: 360)
+        w.isReleasedWhenClosed = false
+        let content = w.contentView!
+
+        display = RSVPDisplayView(frame: .zero)
+        display.wantsLayer = true
+        content.addSubview(display)
+
+        sourceText = NSTextView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        sourceText.minSize = NSSize(width: 0, height: 0)
+        sourceText.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                    height: CGFloat.greatestFiniteMagnitude)
+        sourceText.isVerticallyResizable = true
+        sourceText.isHorizontallyResizable = false
+        sourceText.autoresizingMask = [.width]
+        sourceText.textContainer?.widthTracksTextView = true
+        sourceText.isRichText = false
+        sourceText.font = NSFont.systemFont(ofSize: 14)
+        sourceText.textContainerInset = NSSize(width: 6, height: 6)
+        sourceText.isAutomaticQuoteSubstitutionEnabled = false
+
+        scroll = NSScrollView(frame: .zero)
+        scroll.documentView = sourceText
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        content.addSubview(scroll)
+
+        playPause = FirstMouseButton(title: "Play", target: self, action: #selector(togglePlay))
+        playPause.bezelStyle = .rounded
+        content.addSubview(playPause)
+
+        restart = FirstMouseButton(title: "Restart", target: self, action: #selector(restartTapped))
+        restart.bezelStyle = .rounded
+        content.addSubview(restart)
+
+        wpmLabel = NSTextField(labelWithString: "WPM")
+        content.addSubview(wpmLabel)
+
+        wpmField = NSTextField(frame: .zero)
+        wpmField.stringValue = String(wpm)
+        wpmField.alignment = .right
+        wpmField.isEditable = true
+        wpmField.isBezeled = true
+        wpmField.bezelStyle = .roundedBezel
+        wpmField.target = self
+        wpmField.action = #selector(wpmFieldChanged)
+        content.addSubview(wpmField)
+
+        wpmStepper = NSStepper(frame: .zero)
+        wpmStepper.minValue = 30
+        wpmStepper.maxValue = 1500
+        wpmStepper.increment = 10
+        wpmStepper.valueWraps = false
+        wpmStepper.integerValue = wpm
+        wpmStepper.target = self
+        wpmStepper.action = #selector(wpmStepperChanged)
+        content.addSubview(wpmStepper)
+
+        progress = NSTextField(labelWithString: "")
+        progress.textColor = .secondaryLabelColor
+        progress.alignment = .center
+        content.addSubview(progress)
+
+        audioCheck = NSButton(checkboxWithTitle: "\u{1F50A} Read aloud",
+                              target: self, action: #selector(toggleAudio))
+        content.addSubview(audioCheck)
+
+        window = w
+        w.center()
+        relayout()
+        updateProgress()
+    }
+
+    private func relayout() {
+        guard let content = window?.contentView else { return }
+        let b = content.bounds
+        let pad: CGFloat = 16
+        let barH: CGFloat = 30
+        let displayH: CGFloat = 150
+
+        display.frame = NSRect(x: pad, y: b.height - pad - displayH,
+                               width: b.width - pad * 2, height: displayH)
+
+        // Status/progress line, centered directly under the display.
+        progress.frame = NSRect(x: pad, y: display.frame.minY - 22,
+                                width: b.width - pad * 2, height: 18)
+
+        let barY = pad
+        playPause.frame = NSRect(x: pad,      y: barY, width: 90, height: barH)
+        restart.frame   = NSRect(x: pad + 98, y: barY, width: 90, height: barH)
+
+        audioCheck.sizeToFit()
+        audioCheck.frame = NSRect(x: restart.frame.maxX + 14, y: barY + 5,
+                                  width: audioCheck.frame.width, height: 20)
+
+        let stepperW: CGFloat = 19
+        wpmStepper.frame = NSRect(x: b.width - pad - stepperW, y: barY, width: stepperW, height: barH)
+        let fieldW: CGFloat = 60
+        wpmField.frame = NSRect(x: wpmStepper.frame.minX - 4 - fieldW, y: barY + 3, width: fieldW, height: 22)
+        wpmLabel.frame = NSRect(x: wpmField.frame.minX - 6 - 40,       y: barY + 6, width: 40, height: 18)
+
+        let midTop = progress.frame.minY - 8
+        let midBot = barY + barH + 12
+        scroll.frame = NSRect(x: pad, y: midBot, width: b.width - pad * 2,
+                              height: max(40, midTop - midBot))
+    }
+
+    // MARK: Playback
+
+    @objc private func togglePlay() {
+        if preparing { return }
+        playing ? pause() : play()
+    }
+
+    private func play() {
+        let text = sourceText.string
+        // (Re)tokenize when the source changed or we've run off the end.
+        if text != tokenizedFrom || index >= tokens.count {
+            tokens = Self.tokenize(text)
+            tokenizedFrom = text
+            index = 0
+        }
+        guard !tokens.isEmpty else { NSSound.beep(); return }
+
+        // Audio on and clips not built for this exact text → pre-generate first.
+        if audioEnabled, clipsFrom != text || clips.count != tokens.count {
+            prepareAudioThenPlay(text: text)
+            return
+        }
+        startPlayback()
+    }
+
+    private func startPlayback() {
+        playing = true
+        playPause.title = "Pause"
+        window?.makeFirstResponder(nil)   // stop the caret blinking in the text area
+        showCurrentWord()                 // show (and speak) the word we're on
+        scheduleTick()
+    }
+
+    // Pre-generate one WAV per word, then start. The visual timer still drives
+    // playback, so long clips get cut off — that's the "artificial speedup".
+    private func prepareAudioThenPlay(text: String) {
+        guard let generate = generateClips else { startPlayback(); return }
+        preparationGeneration += 1
+        let generation = preparationGeneration
+        preparing = true
+        playPause.isEnabled = false
+        restart.isEnabled = false
+        audioCheck.isEnabled = false
+        progress.stringValue = "Preparing audio\u{2026}"
+        let snapshot = tokens
+        generate(snapshot,
+            { [weak self] done, total in
+                self?.progress.stringValue = "Preparing audio\u{2026} \(done)/\(total)"
+            },
+            { [weak self] result in
+                guard let self = self else { return }
+                guard generation == self.preparationGeneration,
+                      self.window?.isVisible == true else {
+                    self.cleanupIncomingClips(result)
+                    return
+                }
+                self.preparing = false
+                self.playPause.isEnabled = true
+                self.restart.isEnabled = true
+                self.audioCheck.isEnabled = self.audioAvailable
+                if self.audioEnabled, let clips = result, clips.count == snapshot.count {
+                    self.cleanupClips()      // drop any older set first
+                    self.clips = clips
+                    self.clipsFrom = text
+                } else if self.audioEnabled {
+                    self.clips = []; self.clipsFrom = ""
+                    self.progress.stringValue = "Audio unavailable — playing silently"
+                }
+                self.startPlayback()
+            })
+    }
+
+    private func pause() {
+        playing = false
+        playPause.title = "Play"
+        timer?.invalidate(); timer = nil
+        clipPlayer?.terminate(); clipPlayer = nil
+    }
+
+    private func scheduleTick() {
+        timer?.invalidate()
+        let interval = 60.0 / Double(max(1, wpm))   // seconds per word
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+    }
+
+    private func tick() {
+        index += 1
+        if index >= tokens.count {
+            pause()
+            index = 0            // next Play starts fresh; last word stays on screen
+            updateProgress()
+            return
+        }
+        showCurrentWord()
+    }
+
+    private func showCurrentWord() {
+        guard index < tokens.count else { return }
+        let word = tokens[index]
+        display.token = word
+        display.pivot = RSVPDisplayView.pivotIndex(forLength: word.count)
+        if playing, audioEnabled, index < clips.count { playClip(clips[index]) }
+        updateProgress()
+    }
+
+    // Fire-and-forget playback of one word's clip. Terminating the previous
+    // afplay is what cuts a word short when the next one flashes.
+    private func playClip(_ path: String?) {
+        clipPlayer?.terminate(); clipPlayer = nil
+        guard let path = path else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+        p.arguments = [path]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        clipPlayer = p
+    }
+
+    @objc private func toggleAudio() {
+        audioEnabled = (audioCheck.state == .on) && audioAvailable
+        onAudioToggled?(audioEnabled)
+        if !audioEnabled { clipPlayer?.terminate(); clipPlayer = nil }
+        clips = []; clipsFrom = ""   // regenerate on next Play (voice may have changed)
+    }
+
+    // Delete the per-word temp dirs the daemon created (each WAV lives in its
+    // own ogma_tts_* dir). Guarded by the prefix so we only remove our own.
+    private func cleanupClips() {
+        cleanupIncomingClips(clips)
+        clips = []
+    }
+
+    private func cleanupIncomingClips(_ incoming: [String?]?) {
+        let fm = FileManager.default
+        var dirs = Set<String>()
+        for c in incoming ?? [] { if let c = c { dirs.insert((c as NSString).deletingLastPathComponent) } }
+        for d in dirs where (d as NSString).lastPathComponent.hasPrefix("ogma_tts_") {
+            try? fm.removeItem(atPath: d)
+        }
+    }
+
+    @objc private func restartTapped() {
+        pause()
+        tokens = Self.tokenize(sourceText.string)
+        tokenizedFrom = sourceText.string
+        index = 0
+        if tokens.isEmpty { display.token = ""; updateProgress(); return }
+        showCurrentWord()
+    }
+
+    private func updateProgress() {
+        if tokens.isEmpty { progress.stringValue = ""; return }
+        let shown = min(index + 1, tokens.count)
+        progress.stringValue = "\(shown) / \(tokens.count) words"
+    }
+
+    // MARK: WPM (validated + clamped)
+
+    @objc private func wpmFieldChanged()   { setWpm(wpmField.integerValue) }
+    @objc private func wpmStepperChanged() { setWpm(wpmStepper.integerValue) }
+
+    private func setWpm(_ raw: Int) {
+        let v = clampWpm(raw <= 0 ? wpm : raw)   // blank/garbage → keep current
+        wpm = v
+        wpmField.stringValue = String(v)
+        wpmStepper.integerValue = v
+        onWpmChanged?(v)
+        if playing { scheduleTick() }            // apply the new speed live
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowDidResize(_ notification: Notification) { relayout() }
+    func windowWillClose(_ notification: Notification) {
+        pause()
+        preparationGeneration += 1
+        preparing = false
+        cancelClips?()      // abort any in-flight pre-generation
+        cleanupClips()
+        clipsFrom = ""
+        onClose?()
+    }
+}
+
+// Floating, centered RSVP overlay for ⌥⇧R: flashes the selected text one word
+// at a time in a borderless HUD panel, styled exactly like the dictation card
+// (.hudWindow blur, rounded corners, .statusBar level, click-through). No
+// controls — it plays at the configured WPM and dismisses itself at the end;
+// press ⌥⇧R again to stop early.
+private final class RSVPOverlay: NSObject {
+    private var panel: NSPanel?
+    private var display: RSVPDisplayView?
+    private var tokens: [String] = []
+    private var index = 0
+    private var timer: Timer?
+    private var wpm = 300
+    private(set) var isActive = false
+
+    private static let width: CGFloat = 620
+    private static let height: CGFloat = 220
+
+    // Call on the main thread.
+    func start(tokens: [String], wpm: Int) {
+        self.tokens = tokens
+        self.wpm = max(1, wpm)
+        index = 0
+        if panel == nil { build() }
+        position()
+        isActive = true
+        showWord()
+        panel?.orderFrontRegardless()
+        schedule()
+    }
+
+    // Call on the main thread.
+    func stop() {
+        timer?.invalidate(); timer = nil
+        isActive = false
+        panel?.orderOut(nil)
+    }
+
+    private func build() {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.height),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isFloatingPanel = true
+        p.level = .statusBar
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = true
+        p.ignoresMouseEvents = true                 // click-through; never steals focus
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        p.hidesOnDeactivate = false
+
+        let bg = NSVisualEffectView(frame: p.contentView!.bounds)
+        bg.material = .hudWindow
+        bg.state = .active
+        bg.blendingMode = .behindWindow
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 16
+        bg.layer?.masksToBounds = true
+        bg.autoresizingMask = [.width, .height]
+        p.contentView?.addSubview(bg)
+
+        let d = RSVPDisplayView(frame: p.contentView!.bounds)
+        d.drawBackground = false                    // let the blur show through
+        d.autoresizingMask = [.width, .height]
+        p.contentView?.addSubview(d)
+
+        panel = p
+        display = d
+    }
+
+    private func position() {
+        guard let panel = panel, let screen = NSScreen.main else { return }
+        let vf = screen.visibleFrame
+        panel.setFrame(NSRect(x: vf.midX - Self.width / 2, y: vf.midY - Self.height / 2,
+                              width: Self.width, height: Self.height), display: true)
+    }
+
+    private func showWord() {
+        guard index < tokens.count else { return }
+        let w = tokens[index]
+        display?.token = w
+        display?.pivot = RSVPDisplayView.pivotIndex(forLength: w.count)
+    }
+
+    private func schedule() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 60.0 / Double(wpm), repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+    }
+
+    private func tick() {
+        index += 1
+        if index >= tokens.count {
+            timer?.invalidate(); timer = nil
+            // Linger on the last word, then dismiss.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self = self, self.isActive else { return }
+                self.stop()
+            }
+            return
+        }
+        showWord()
+    }
+}
+
+// MARK: - Compact recording indicator
+
+private enum RecordingIndicatorMode: String {
+    case none, simple, detailed
+}
+
+// A longer version of the rounded-bar menu icon. It keeps a short level
+// history so speech travels across the strip instead of merely blinking.
+private final class RecordingWaveformView: NSView {
+    private static let sampleCount = 44
+    private var levels = [CGFloat](repeating: 0.05, count: sampleCount)
+
+    func reset() {
+        levels = [CGFloat](repeating: 0.05, count: Self.sampleCount)
+        needsDisplay = true
+    }
+
+    func push(level: CGFloat) {
+        levels.removeFirst()
+        levels.append(min(max(level, 0.03), 1.0))
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let gap: CGFloat = 3
+        let barWidth = max(2, (bounds.width - gap * CGFloat(Self.sampleCount - 1))
+                               / CGFloat(Self.sampleCount))
+        let totalWidth = CGFloat(Self.sampleCount) * barWidth
+            + CGFloat(Self.sampleCount - 1) * gap
+        let startX = bounds.midX - totalWidth / 2
+        NSColor.labelColor.withAlphaComponent(0.86).setFill()
+        for (index, level) in levels.enumerated() {
+            let barHeight = 4 + level * max(0, bounds.height - 4)
+            let rect = NSRect(x: startX + CGFloat(index) * (barWidth + gap),
+                              y: bounds.midY - barHeight / 2,
+                              width: barWidth, height: barHeight)
+            NSBezierPath(roundedRect: rect,
+                         xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
+        }
+    }
+}
+
+private final class RecordingIndicatorOverlay: NSObject {
+    private static let width: CGFloat = 500
+    private static let height: CGFloat = 76
+
+    private var panel: NSPanel?
+    private var waveform: RecordingWaveformView?
+    var onStop: (() -> Void)?
+
+    func show() {
+        DispatchQueue.main.async {
+            if self.panel == nil { self.build() }
+            self.waveform?.reset()
+            self.position()
+            self.panel?.orderFrontRegardless()
+        }
+    }
+
+    func update(level: CGFloat) {
+        DispatchQueue.main.async { self.waveform?.push(level: level) }
+    }
+
+    func hide() {
+        DispatchQueue.main.async { self.panel?.orderOut(nil) }
+    }
+
+    @objc private func stopTapped() {
+        onStop?()
+    }
+
+    private func build() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        let background = NSVisualEffectView(frame: panel.contentView!.bounds)
+        background.material = .hudWindow
+        background.state = .active
+        background.blendingMode = .behindWindow
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 16
+        background.layer?.masksToBounds = true
+        background.autoresizingMask = [.width, .height]
+        panel.contentView?.addSubview(background)
+
+        let meter = RecordingWaveformView(frame: NSRect(
+            x: 22, y: 20, width: Self.width - 190, height: Self.height - 40))
+        meter.autoresizingMask = [.width]
+        background.addSubview(meter)
+
+        let stop = FirstMouseButton(title: "\u{25A0}  Stop Recording",
+                                    target: self, action: #selector(stopTapped))
+        stop.bezelStyle = .rounded
+        stop.sizeToFit()
+        stop.frame.origin = NSPoint(x: Self.width - stop.frame.width - 22,
+                                    y: (Self.height - stop.frame.height) / 2)
+        stop.autoresizingMask = [.minXMargin]
+        background.addSubview(stop)
+
+        self.panel = panel
+        self.waveform = meter
+    }
+
+    private func position() {
+        guard let panel, let screen = NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        panel.setFrameOrigin(NSPoint(x: visible.midX - Self.width / 2,
+                                     y: visible.minY + 120))
+    }
+}
+
 // MARK: - App delegate
 
 @objc final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -1187,6 +1991,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     private var animTimer:   Timer?
     private var countdownTimer: Timer?
     private var animPhase:   Double = 0
+    private var dictationWavePhase: Double = 0
 
     // Respeak state — synchronized via speakLock
     private var speakGeneration = 0
@@ -1207,6 +2012,12 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     private var audioConverter: AVAudioConverter?
     private var sttClient: STTStreamClient?
     private let overlay = DictationOverlay()
+    private let recordingOverlay = RecordingIndicatorOverlay()
+
+    // Speed reader (RSVP) — created lazily on first open.
+    private var speedReader: SpeedReadController?
+    // Floating ⌥⇧R speed-read overlay — created lazily on first use.
+    private var rsvpOverlay: RSVPOverlay?
     // .starting spans the async gap between the hotkey and the engine
     // actually running (e.g. the mic-permission prompt), so a second press
     // there can't double-start.
@@ -1224,6 +2035,10 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     private var dictationTargetApp: NSRunningApplication?
     private let recordLock = NSLock()
 
+    private var recordingIndicatorMode: RecordingIndicatorMode {
+        RecordingIndicatorMode(rawValue: config.recordingIndicator) ?? .detailed
+    }
+
     private func setDictationState(_ s: DictationState) {
         recordLock.lock(); dictationState = s; recordLock.unlock()
     }
@@ -1239,6 +2054,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         appDelegateRef = self
         overlay.onInsert = { [weak self] text in self?.completeReview(insert: text) }
         overlay.onDiscard = { [weak self] in self?.completeReview(insert: nil) }
+        recordingOverlay.onStop = { [weak self] in self?.stopDictation() }
         syncBundledResources()
         installHotkey()
         startHotkeyHealthTimer()
@@ -1249,7 +2065,6 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         }
         updateTTSDaemon()
         fetchCredits()
-        if config.shareCorrections { uploadPendingCorrections() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1264,7 +2079,10 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         let fresh = Config.load()
         if fresh.backendsInstalled != config.backendsInstalled ||
-           fresh.ttsBackend != config.ttsBackend {
+           fresh.ttsBackend != config.ttsBackend ||
+           fresh.sttEnginesInstalled != config.sttEnginesInstalled ||
+           fresh.sttEngine != config.sttEngine ||
+           fresh.recordingIndicator != config.recordingIndicator {
             config = fresh
             rebuildMenu()
             updateTTSDaemon()
@@ -1307,7 +2125,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         }
     }
 
-    private func waveformFrame(phase: Double) -> NSImage {
+    private func waveformFrame(phase: Double, amplitude: CGFloat? = nil) -> NSImage {
         let w: CGFloat = 18, h: CGFloat = 18
         let barCount   = 5
         let barWidth:  CGFloat = 2
@@ -1322,7 +2140,13 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             let norm = (sin(t) + 1) / 2          // 0…1
             let minH: CGFloat = 3
             let maxH: CGFloat = 14
-            let barH = minH + CGFloat(norm) * (maxH - minH)
+            let barH: CGFloat
+            if let amplitude {
+                let shape = 0.45 + CGFloat(norm) * 0.55
+                barH = minH + min(max(amplitude, 0), 1) * shape * (maxH - minH)
+            } else {
+                barH = minH + CGFloat(norm) * (maxH - minH)
+            }
             let x = startX + CGFloat(i) * (barWidth + gap)
             let y = (h - barH) / 2
             let rect = NSRect(x: x, y: y, width: barWidth, height: barH)
@@ -1367,6 +2191,43 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             Thread.sleep(forTimeInterval: 0.2)
 
             runSpeak()
+        }
+    }
+
+    // ⌥⇧R: flash the current selection word-by-word in a centered HUD overlay.
+    // Toggles — a second press while it's up stops it. Runs on the hotkey's
+    // background thread; the ⌘C synthesis + clipboard read mirror handleHotkey.
+    func handleSpeedReadHotkey() {
+        var active = false
+        DispatchQueue.main.sync { active = self.rsvpOverlay?.isActive ?? false }
+        if active {
+            DispatchQueue.main.async { self.rsvpOverlay?.stop() }
+            return
+        }
+
+        // A selection inside our own review card is read directly.
+        var text: String?
+        DispatchQueue.main.sync { text = self.overlay.selectedTranscriptText() }
+
+        if (text ?? "").isEmpty {
+            // Synthesize ⌘C into the active app, then read the clipboard.
+            let src = CGEventSource(stateID: .hidSystemState)
+            let cDown = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: true)
+            cDown?.flags = .maskCommand
+            let cUp   = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: false)
+            cUp?.flags = .maskCommand
+            cDown?.post(tap: .cgAnnotatedSessionEventTap)
+            cUp?.post(tap: .cgAnnotatedSessionEventTap)
+            Thread.sleep(forTimeInterval: 0.2)
+            text = NSPasteboard.general.string(forType: .string)
+        }
+
+        let words = SpeedReadController.tokenize(text ?? "")
+        guard !words.isEmpty else { NSSound.beep(); return }
+        let wpm = config.wpm
+        DispatchQueue.main.async {
+            if self.rsvpOverlay == nil { self.rsvpOverlay = RSVPOverlay() }
+            self.rsvpOverlay?.start(tokens: words, wpm: wpm)
         }
     }
 
@@ -1670,6 +2531,107 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         if !needsDaemon { stopTTSDaemon() }
     }
 
+    // MARK: - Speed reader audio (per-word Kokoro clips)
+
+    // Generation IDs make cancellation race-free: a closed reader's worker
+    // cannot become live again merely because a newly opened reader starts.
+    private let speedReadGenLock = NSLock()
+    private var speedReadGeneration = 0
+    private let speedReadGenQueue = DispatchQueue(label: "ogma.speedread.gen")
+
+    private func beginSpeedReadGeneration() -> Int {
+        speedReadGenLock.lock()
+        defer { speedReadGenLock.unlock() }
+        speedReadGeneration += 1
+        return speedReadGeneration
+    }
+
+    private func cancelSpeedReadGeneration() {
+        speedReadGenLock.lock()
+        speedReadGeneration += 1
+        speedReadGenLock.unlock()
+    }
+
+    private func isCurrentSpeedReadGeneration(_ generation: Int) -> Bool {
+        speedReadGenLock.lock()
+        defer { speedReadGenLock.unlock() }
+        return speedReadGeneration == generation
+    }
+
+    // Start the managed Kokoro daemon regardless of the active TTS backend
+    // (speed-read audio is local-only). No-op if local isn't installed or the
+    // daemon is already running. The daemon creates its socket after warmup.
+    private func ensureTTSDaemonForSpeedRead() {
+        if let existing = ttsDaemonProcess, existing.isRunning { return }
+        guard isLocalInstalled else { return }
+        let python = venvPythonPath, server = ttsServerPath
+        guard FileManager.default.isExecutableFile(atPath: python),
+              FileManager.default.fileExists(atPath: server) else { return }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: python)
+        task.arguments = [server, "--managed"]
+        task.standardInput = FileHandle.nullDevice
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do { try task.run(); ttsDaemonProcess = task } catch {}
+    }
+
+    // Generate one WAV per token via the warm Kokoro daemon at 2× speed. Runs
+    // off the main thread; progress + completion fire on main. completion(nil)
+    // means the run failed or was cancelled.
+    private func generateSpeedReadClips(
+        tokens: [String],
+        progress: @escaping (Int, Int) -> Void,
+        completion: @escaping ([String?]?) -> Void
+    ) {
+        let generation = beginSpeedReadGeneration()
+        let voice = config.localVoice
+        let lang = String(voice.prefix(1))
+        let sock = ttsSocketPath
+
+        speedReadGenQueue.async { [weak self] in
+            guard let self = self else { DispatchQueue.main.async { completion(nil) }; return }
+
+            // Ensure the daemon is up (it creates the socket only after warmup).
+            if !FileManager.default.fileExists(atPath: sock) {
+                DispatchQueue.main.sync { self.ensureTTSDaemonForSpeedRead() }
+                var waited = 0.0
+                while !FileManager.default.fileExists(atPath: sock),
+                      waited < 40, self.isCurrentSpeedReadGeneration(generation) {
+                    Thread.sleep(forTimeInterval: 0.25); waited += 0.25
+                }
+            }
+            guard FileManager.default.fileExists(atPath: sock),
+                  self.isCurrentSpeedReadGeneration(generation) else {
+                DispatchQueue.main.async { completion(nil) }; return
+            }
+
+            var clips: [String?] = []
+            let total = tokens.count
+            for (i, tok) in tokens.enumerated() {
+                if !self.isCurrentSpeedReadGeneration(generation) {
+                    // Return partial paths so the controller can delete their
+                    // temp directories even though it will not play them.
+                    DispatchQueue.main.async { completion(clips) }
+                    return
+                }
+                // Pure-punctuation tokens have nothing to speak → silent slot.
+                let speakable = tok.contains { $0.isLetter || $0.isNumber }
+                clips.append(speakable
+                    ? ttsRequestClip(text: tok, voice: voice, speed: "2.00", lang: lang, socketPath: sock)
+                    : nil)
+                let done = i + 1
+                DispatchQueue.main.async {
+                    if self.isCurrentSpeedReadGeneration(generation) { progress(done, total) }
+                }
+            }
+            DispatchQueue.main.async {
+                // A stale controller generation discards and cleans these paths.
+                completion(clips)
+            }
+        }
+    }
+
     // MARK: - STT (dictation) daemon + paths
 
     private var sttServerPath: String {
@@ -1830,6 +2792,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     // for the session that is still current (identity-guarded). Returns the
     // engine-start error, or nil on success.
     private func startStreamingSession(
+        wantsPartials: Bool,
         onPartial: @escaping (String, [STTWord]) -> Void,
         onFinal: @escaping (String, [STTWord]) -> Void) -> Error? {
         // Warm the model now so it's ready by the time the user stops talking.
@@ -1879,7 +2842,8 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             }
             guard !client.isClosed else { return }   // session already torn down
             _ = client.connect(socketPath: self.sttSocketPath,
-                               sampleRate: Self.sttSampleRate)
+                               sampleRate: Self.sttSampleRate,
+                               wantsPartials: wantsPartials)
         }
 
         input.installTap(onBus: 0, bufferSize: 4096, format: hwFormat) { [weak self] buffer, _ in
@@ -1896,6 +2860,14 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             if let ch = outBuf.floatChannelData, outBuf.frameLength > 0 {
                 let samples = Array(UnsafeBufferPointer(start: ch[0], count: Int(outBuf.frameLength)))
                 self.sttClient?.send(samples: samples)
+                var sumSquares: Float = 0
+                for sample in samples { sumSquares += sample * sample }
+                let rms = sqrt(sumSquares / Float(samples.count))
+                let decibels = 20 * log10(max(rms, 0.000_01))
+                let level = min(max((decibels + 55) / 45, 0), 1)
+                DispatchQueue.main.async { [weak self] in
+                    self?.updateRecordingLevel(CGFloat(level))
+                }
             }
         }
 
@@ -1913,21 +2885,32 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         setDictating(false)
+        recordingOverlay.hide()
         dictationStopAt = CFAbsoluteTimeGetCurrent()
     }
 
     private func beginRecording() {
-        overlay.beginLiveDictation()
+        switch recordingIndicatorMode {
+        case .none:
+            break
+        case .simple:
+            recordingOverlay.show()
+        case .detailed:
+            overlay.beginLiveDictation()
+        }
         let error = startStreamingSession(
+            wantsPartials: recordingIndicatorMode == .detailed,
             onPartial: { [weak self] p, words in
-                self?.overlay.updateCardDictation(p.isEmpty ? "Listening\u{2026}" : p,
-                                                  words: p.isEmpty ? [] : words)
+                guard let self, self.recordingIndicatorMode == .detailed else { return }
+                self.overlay.updateCardDictation(p.isEmpty ? "Listening\u{2026}" : p,
+                                                 words: p.isEmpty ? [] : words)
             },
             onFinal: { [weak self] f, words in
                 self?.finishDictation(final: f, words: words)
             })
         if let error = error {
             overlay.hide()
+            recordingOverlay.hide()
             setDictationState(.idle)
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()
@@ -1950,14 +2933,18 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         // linger. On a cold start the model can take a long time to load and
         // the connect poller waits up to 30s — give that path time instead of
         // silently discarding the dictation at 6s. Guarded so it can't touch
-        // a newer session or a showing review card.
-        let timeout: Double = isSTTModelLoaded ? 6 : 35
+        // a newer session or a showing review card. The voxtral engine
+        // decodes the whole utterance once more for the final, so its warm
+        // timeout must absorb a long utterance's decode as well.
+        let warmTimeout: Double = config.sttEngine == "voxtral" ? 20 : 6
+        let timeout: Double = isSTTModelLoaded ? warmTimeout : 35
         let gen = dictationGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self = self,
                   self.dictationGeneration == gen,
                   self.currentDictationState() == .awaitingFinal else { return }
             self.overlay.hide()
+            self.recordingOverlay.hide()
             self.cleanupDictation()
             self.setDictationState(.idle)
         }
@@ -1974,6 +2961,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         let text = final.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty {
             overlay.hide()
+            recordingOverlay.hide()
             setDictationState(.idle)
             return
         }
@@ -2003,7 +2991,6 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         dictationTargetApp = nil
         guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else { return }
-        recordCorrectionIfEnabled(final: text)
         // Give the window server a beat to route key focus back to the
         // frontmost app after the panel orders out, then deliver.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
@@ -2017,6 +3004,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         guard currentDictationState() == .reviewing else { return }
         overlay.beginCardDictation()
         let error = startStreamingSession(
+            wantsPartials: true,
             onPartial: { [weak self] p, _ in
                 self?.overlay.updateCardDictation(p)
             },
@@ -2108,23 +3096,42 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         }
     }
 
-    // The app already holds Accessibility trust — ask whether the target has a
-    // focused UI element. This is now advisory ONLY for injectText's restore
-    // decision, never a paste gate: a `.noValue` (AX-opaque apps like Ghostty)
-    // just means "don't restore the old clipboard over the transcript," so an
-    // AX false-negative costs at most a retained clipboard entry, never a paste.
-    private func axHasFocusedElement(pid: pid_t) -> Bool {
+    private struct EditablePasteTarget {
+        let element: AXUIElement
+        let value: String
+    }
+
+    // Only text controls with an observable value are eligible for clipboard
+    // restoration. AX-opaque editors still receive the paste, but keep the
+    // transcript on the clipboard because insertion cannot be verified there.
+    private func editablePasteTarget(pid: pid_t) -> EditablePasteTarget? {
         let app = AXUIElementCreateApplication(pid)
-        // A hung target must not beachball us for the default ~6s AX timeout.
         AXUIElementSetMessagingTimeout(app, 0.3)
-        var value: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(
-            app, kAXFocusedUIElementAttribute as CFString, &value)
-        switch err {
-        case .success: return value != nil
-        case .noValue: return false
-        default:       return true
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString,
+                                             &focused) == .success,
+              let element = focused else { return nil }
+        let target = element as! AXUIElement
+        AXUIElementSetMessagingTimeout(target, 0.3)
+
+        var roleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(target, kAXRoleAttribute as CFString,
+                                             &roleValue) == .success,
+              let role = roleValue as? String,
+              role == kAXTextFieldRole || role == kAXTextAreaRole else { return nil }
+
+        var valueSettable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(target, kAXValueAttribute as CFString,
+                                              &valueSettable) == .success,
+              valueSettable.boolValue else {
+            return nil
         }
+
+        var textValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(target, kAXValueAttribute as CFString,
+                                             &textValue) == .success,
+              let value = textValue as? String else { return nil }
+        return EditablePasteTarget(element: target, value: value)
     }
 
     private func copyTranscriptFallback(_ text: String) {
@@ -2147,25 +3154,17 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         audioConverter = nil
     }
 
-    // Insert transcribed text at the cursor via the pasteboard + ⌘V, then
-    // restore the previous clipboard. Uses the app's existing Accessibility
-    // grant (same as the ⌥⇧/ ⌘C synthesis). Waits 1s so a busy target still
-    // pastes the transcript, not the restored old clipboard.
-    //
-    // Fail-safe restore: since the paste is now unconditional (no AX pre-gate),
-    // we only restore the old clipboard when there's positive evidence the paste
-    // had a live target — otherwise we leave the transcript on the clipboard so a
-    // missed paste can never lose it. Restore only if: (a) the user hasn't copied
-    // since, (b) the same app is still frontmost and secure input isn't engaged,
-    // and (c) that app actually exposed a focused element. Any "no" keeps the
-    // transcript on the clipboard for a manual ⌘V.
+    // Insert transcribed text via the pasteboard + ⌘V. Restore every original
+    // pasteboard type only after observing the text in a real editable AX
+    // target; otherwise retain the transcript for a reliable manual paste.
     private func injectText(_ text: String) {
         let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
+        let savedItems = snapshotPasteboardItems(pb.pasteboardItems ?? [])
+        let targetPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let target = targetPid.flatMap { editablePasteTarget(pid: $0) }
         pb.clearContents()
         pb.setString(text, forType: .string)
         let myChange = pb.changeCount
-        let targetPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         let src = CGEventSource(stateID: .hidSystemState)
         let vDown = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: true)  // 9 = V
@@ -2176,24 +3175,50 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         vUp?.post(tap: .cgAnnotatedSessionEventTap)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard pb.changeCount == myChange else { return }   // (a) user copied since — never clobber
+            guard pb.changeCount == myChange else { return }   // user copied since — never clobber
             let stillSafe = NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
                 && !IsSecureEventInputEnabled()
-            guard stillSafe else { return }                    // (b) foreground changed / secure — keep transcript
-            if let pid = targetPid, self?.axHasFocusedElement(pid: pid) == false {
-                return                                         // (c) no editable focus was there — keep transcript
-            }
-            guard let saved = saved else { return }
+            guard stillSafe, let pid = targetPid, let target = target,
+                  let current = self?.editablePasteTarget(pid: pid),
+                  CFEqual(current.element, target.element),
+                  current.value != target.value,
+                  current.value.contains(text) else { return }
+            guard !savedItems.isEmpty else { return }
             pb.clearContents()
-            pb.setString(saved, forType: .string)
+            pb.writeObjects(savedItems)
         }
     }
 
-    // Swap the menu bar icon to a mic while recording.
+    private func updateRecordingLevel(_ level: CGFloat) {
+        guard currentDictationState() == .recording
+                || currentDictationState() == .cardRecording else { return }
+        dictationWavePhase += 0.7
+        switch recordingIndicatorMode {
+        case .none:
+            statusItem.button?.image = waveformFrame(
+                phase: dictationWavePhase, amplitude: max(level, 0.16))
+        case .simple:
+            statusItem.button?.image = waveformFrame(
+                phase: dictationWavePhase, amplitude: max(level, 0.16))
+            recordingOverlay.update(level: level)
+        case .detailed:
+            break
+        }
+    }
+
+    // Detailed mode retains the original mic glyph. None and Simple use the
+    // same rounded waveform language as the normal Ogma menu-bar icon, driven
+    // by the live microphone level.
     private func setDictating(_ active: Bool) {
         if active {
-            statusItem.button?.image = NSImage(
-                systemSymbolName: "mic.fill", accessibilityDescription: "Dictating")
+            dictationWavePhase = 0
+            if recordingIndicatorMode == .detailed {
+                statusItem.button?.image = NSImage(
+                    systemSymbolName: "mic.fill", accessibilityDescription: "Dictating")
+            } else {
+                statusItem.button?.image = waveformFrame(phase: 0, amplitude: 0.16)
+                statusItem.button?.image?.accessibilityDescription = "Dictating"
+            }
         } else {
             statusItem.button?.image = NSImage(
                 systemSymbolName: "waveform", accessibilityDescription: "Ogma")
@@ -2352,8 +3377,8 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
-        // Backend submenu — always visible so users can discover and switch
-        menu.addItem(submenuItem("Backend", items: buildBackendItems()))
+        // TTS engine selection leads the text-to-speech controls.
+        menu.addItem(submenuItem("TTS Engine", items: buildBackendItems()))
         menu.addItem(.separator())
 
         let showEl      = config.ttsBackend == "auto" || config.ttsBackend == "elevenlabs"
@@ -2406,57 +3431,6 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             menu.addItem(.separator())
         }
 
-        // ── Dictation (Parakeet STT) section ──
-        if isSTTInstalled {
-            if showHeaders { menu.addItem(hintItem("Dictation \u{2014} \u{2325}\u{21E7}D")) }
-            let sttToggle = NSMenuItem(title: sttModelToggleTitle(),
-                                       action: #selector(toggleSttModel), keyEquivalent: "")
-            sttToggle.target = self
-            sttToggle.tag = 996
-            menu.addItem(sttToggle)
-
-            let sttCountdown = NSMenuItem(
-                title: countdownTitle(remainingSeconds(statePath: sttStatePath, loaded: isSTTModelLoaded)),
-                action: nil, keyEquivalent: "")
-            sttCountdown.tag = 995
-            sttCountdown.isEnabled = false
-            sttCountdown.isHidden = !isSTTModelLoaded
-            menu.addItem(sttCountdown)
-
-            let review = NSMenuItem(title: "Review before insert",
-                                    action: #selector(toggleDictationReview), keyEquivalent: "")
-            review.target = self
-            review.state = config.dictationReview ? .on : .off
-            menu.addItem(review)
-
-            let dict = NSMenuItem(title: "Dictionary\u{2026}",
-                                  action: #selector(editDictionary), keyEquivalent: "")
-            dict.target = self
-            menu.addItem(dict)
-
-            menu.addItem(submenuItem("Improve Dictation",
-                                     items: buildImproveDictationItems()))
-
-            menu.addItem(submenuItem("Auto-unload after",
-                                     items: buildSttIdleTimeoutItems()))
-            if AVCaptureDevice.authorizationStatus(for: .audio) == .denied {
-                let warn = NSMenuItem(title: "\u{26A0}\u{FE0F}  Enable Microphone for dictation",
-                                      action: #selector(requestMicPermission), keyEquivalent: "")
-                warn.target = self
-                menu.addItem(warn)
-            }
-            menu.addItem(.separator())
-        }
-
-        // Sentence Pause — playback-level setting, applies to all backends
-        let pauseItem = NSMenuItem(
-            title:  "Sentence Pause: \(config.sentencePause) ms",
-            action: #selector(editSentencePause),
-            keyEquivalent: "")
-        pauseItem.target = self
-        menu.addItem(pauseItem)
-        menu.addItem(.separator())
-
         // API Key + Credits — when ElevenLabs is active
         if showEl {
             // Credits display (hidden until successfully fetched)
@@ -2474,7 +3448,60 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             menu.addItem(apiItem)
         }
 
+        // Sentence Pause is the final TTS setting regardless of engine.
+        let pauseItem = NSMenuItem(
+            title:  "Sentence Pause: \(config.sentencePause) ms",
+            action: #selector(editSentencePause),
+            keyEquivalent: "")
+        pauseItem.target = self
+        menu.addItem(pauseItem)
         menu.addItem(.separator())
+
+        // ── Speech-to-text section ──
+        if isSTTInstalled {
+            menu.addItem(hintItem("Dictation \u{2014} \u{2325}\u{21E7}D"))
+
+            // Engine selection leads the STT controls.
+            menu.addItem(submenuItem("STT Engine", items: buildSttEngineItems()))
+
+            let sttToggle = NSMenuItem(title: sttModelToggleTitle(),
+                                       action: #selector(toggleSttModel), keyEquivalent: "")
+            sttToggle.target = self
+            sttToggle.tag = 996
+            menu.addItem(sttToggle)
+
+            let sttCountdown = NSMenuItem(
+                title: countdownTitle(remainingSeconds(statePath: sttStatePath, loaded: isSTTModelLoaded)),
+                action: nil, keyEquivalent: "")
+            sttCountdown.tag = 995
+            sttCountdown.isEnabled = false
+            sttCountdown.isHidden = !isSTTModelLoaded
+            menu.addItem(sttCountdown)
+
+            menu.addItem(submenuItem("Recording Indicator",
+                                     items: buildRecordingIndicatorItems()))
+
+            let review = NSMenuItem(title: "Review before insert",
+                                    action: #selector(toggleDictationReview), keyEquivalent: "")
+            review.target = self
+            review.state = config.dictationReview ? .on : .off
+            menu.addItem(review)
+
+            let dict = NSMenuItem(title: "Dictionary\u{2026}",
+                                  action: #selector(editDictionary), keyEquivalent: "")
+            dict.target = self
+            menu.addItem(dict)
+
+            menu.addItem(submenuItem("Auto-unload after",
+                                     items: buildSttIdleTimeoutItems()))
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .denied {
+                let warn = NSMenuItem(title: "\u{26A0}\u{FE0F}  Enable Microphone for dictation",
+                                      action: #selector(requestMicPermission), keyEquivalent: "")
+                warn.target = self
+                menu.addItem(warn)
+            }
+            menu.addItem(.separator())
+        }
 
         if !AXIsProcessTrusted() {
             let warn = NSMenuItem(
@@ -2485,6 +3512,13 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             menu.addItem(warn)
             menu.addItem(.separator())
         }
+
+        // Speed Reader intentionally remains separate from TTS/STT settings.
+        let speedRead = NSMenuItem(title: "Speed Read\u{2026}",
+                                   action: #selector(openSpeedReader), keyEquivalent: "")
+        speedRead.target = self
+        menu.addItem(speedRead)
+        menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit",
                               action: #selector(NSApplication.terminate(_:)),
@@ -2550,6 +3584,26 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
                  repr: String(s.value), on: s.value == config.localIdleTimeout)
         }
         return items
+    }
+
+    private func buildSttEngineItems() -> [NSMenuItem] {
+        [
+            item("Parakeet (fast)", #selector(pickSttEngine(_:)),
+                 repr: "parakeet", on: config.sttEngine == "parakeet"),
+            item("Voxtral (best accuracy)", #selector(pickSttEngine(_:)),
+                 repr: "voxtral", on: config.sttEngine == "voxtral"),
+        ]
+    }
+
+    private func buildRecordingIndicatorItems() -> [NSMenuItem] {
+        [
+            item("None \u{2014} menu bar only", #selector(pickRecordingIndicator(_:)),
+                 repr: "none", on: recordingIndicatorMode == .none),
+            item("Simple \u{2014} audio meter", #selector(pickRecordingIndicator(_:)),
+                 repr: "simple", on: recordingIndicatorMode == .simple),
+            item("Detailed \u{2014} live transcript", #selector(pickRecordingIndicator(_:)),
+                 repr: "detailed", on: recordingIndicatorMode == .detailed),
+        ]
     }
 
     private func buildSttIdleTimeoutItems() -> [NSMenuItem] {
@@ -2629,6 +3683,14 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         config.backendsInstalled == "local" || config.backendsInstalled == "both"
     }
 
+    private var isVoxtralInstalled: Bool {
+        guard config.sttEnginesInstalled == "both" else { return false }
+        let marker = (ogmaDataDir as NSString).appendingPathComponent("voxtral-model-id")
+        let installed = (try? String(contentsOfFile: marker, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return installed == voxtralModelId
+    }
+
     private var installLocalPath: String {
         ((speakPath as NSString).deletingLastPathComponent as NSString)
             .appendingPathComponent("install-local.sh")
@@ -2658,11 +3720,13 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     /// Run install-local.sh in background. On success, reload config, set
     /// desiredBackend (because install-local.sh forces TTS_BACKEND="local"),
     /// and rebuild the menu.
-    private func runInstallLocal(desiredBackend: String, completion: @escaping (Bool) -> Void) {
+    private func runInstallLocal(desiredBackend: String, withVoxtral: Bool = false,
+                                 completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/bin/bash")
-            task.arguments = [installLocalPath]
+            task.arguments = withVoxtral ? [installLocalPath, "--with-voxtral"]
+                                         : [installLocalPath]
             task.standardOutput = FileHandle.nullDevice
             task.standardError  = FileHandle.nullDevice
             do { try task.run() } catch {
@@ -2725,12 +3789,17 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         let marker = (ogmaDataDir as NSString).appendingPathComponent("app-version")
         let installedVersion = (try? String(contentsOfFile: marker, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if installedVersion == version, fm.isExecutableFile(atPath: speakPath) { return }
-
+        let bundledNames = (try? fm.contentsOfDirectory(atPath: scriptsDir)) ?? []
         let binDir = (speakPath as NSString).deletingLastPathComponent
+        let helpersReady = bundledNames.allSatisfy {
+            fm.isExecutableFile(atPath: (binDir as NSString).appendingPathComponent($0))
+        }
+        if installedVersion == version, helpersReady { return }
+
         try? fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
         try? fm.createDirectory(atPath: ogmaDataDir, withIntermediateDirectories: true)
-        for name in (try? fm.contentsOfDirectory(atPath: scriptsDir)) ?? [] {
+        var copiedEverything = !bundledNames.isEmpty
+        for name in bundledNames {
             let src = (scriptsDir as NSString).appendingPathComponent(name)
             let dst = (binDir as NSString).appendingPathComponent(name)
             try? fm.removeItem(atPath: dst)
@@ -2739,10 +3808,13 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
                 try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst)
             } catch {
                 NSLog("Ogma: failed to install \(name): \(error.localizedDescription)")
+                copiedEverything = false
             }
         }
         installServicesWorkflow()
-        try? version.write(toFile: marker, atomically: true, encoding: .utf8)
+        if copiedEverything {
+            try? version.write(toFile: marker, atomically: true, encoding: .utf8)
+        }
     }
 
     /// First launch of a packaged install: no config file exists yet, so walk
@@ -3248,7 +4320,16 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let val = field.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !val.isEmpty else { return }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
+        guard !val.isEmpty, val.count <= 128,
+              val.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+            let invalid = NSAlert()
+            invalid.messageText = "Invalid Voice ID"
+            invalid.informativeText = "Voice IDs may contain only letters, numbers, underscores, and hyphens."
+            invalid.addButton(withTitle: "OK")
+            invalid.runModal()
+            return
+        }
         config.voiceId = val
         config.save()
         rebuildMenu()
@@ -3324,6 +4405,61 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         updateModelMenuItems()
     }
 
+    @objc private func pickSttEngine(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              id != config.sttEngine else { return }
+
+        if id == "voxtral" && !isVoxtralInstalled {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Install Voxtral Engine"
+            alert.informativeText = "Voxtral Realtime 4B produces noticeably better grammar and punctuation than Parakeet. Its stateful decoder provides live text in Detailed mode and fast final text in every recording mode.\n\nThis downloads ~3.2 GB of Apache-licensed model weights."
+            alert.addButton(withTitle: "Install")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            config.sttEngine = id
+            config.save()
+            rebuildMenu()
+            runInstallLocal(desiredBackend: config.ttsBackend, withVoxtral: true) { [weak self] ok in
+                guard let self = self else { return }
+                if ok {
+                    self.unloadSTTModel()   // next dictation restarts with Voxtral
+                } else {
+                    self.config.sttEngine = "parakeet"
+                    self.config.save()
+                    self.rebuildMenu()
+                }
+                NSApp.activate(ignoringOtherApps: true)
+                let a = NSAlert()
+                if ok {
+                    a.messageText = "Voxtral Engine Installed"
+                    a.informativeText = "Dictation now uses Voxtral Realtime 4B. The first dictation after a model load takes a few extra seconds."
+                } else {
+                    a.messageText = "Installation Failed"
+                    a.informativeText = "Could not install the Voxtral engine.\n\nAn internet connection is required for the download.\nPlease check your connection and try again."
+                    a.alertStyle = .warning
+                }
+                a.addButton(withTitle: "OK")
+                a.runModal()
+            }
+            return
+        }
+
+        config.sttEngine = id
+        config.save()
+        rebuildMenu()
+        unloadSTTModel()   // daemon restarts with the new engine on next use
+    }
+
+    @objc private func pickRecordingIndicator(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String,
+              RecordingIndicatorMode(rawValue: value) != nil,
+              value != config.recordingIndicator else { return }
+        config.recordingIndicator = value
+        config.save()
+        rebuildMenu()
+    }
+
     @objc private func toggleDictationReview() {
         config.dictationReview.toggle()
         config.save()
@@ -3397,6 +4533,33 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         }
     }
 
+    // Open the RSVP speed-read window. Switch to .regular so it's a real key
+    // window with a working Edit menu (⌘V paste) — the same reason NSAlert
+    // text fields do (see the activation-policy note on the review card).
+    // windowWillClose restores .accessory.
+    @objc private func openSpeedReader() {
+        if speedReader == nil {
+            let sr = SpeedReadController()
+            sr.onWpmChanged = { [weak self] wpm in
+                self?.config.wpm = wpm
+                self?.config.save()
+            }
+            sr.onAudioToggled = { [weak self] on in
+                self?.config.speedReadAudio = on
+                self?.config.save()
+            }
+            sr.generateClips = { [weak self] tokens, progress, completion in
+                self?.generateSpeedReadClips(tokens: tokens, progress: progress, completion: completion)
+            }
+            sr.cancelClips = { [weak self] in self?.cancelSpeedReadGeneration() }
+            sr.onClose = { NSApp.setActivationPolicy(.accessory) }
+            speedReader = sr
+        }
+        speedReader?.audioAvailable = isLocalInstalled
+        NSApp.setActivationPolicy(.regular)
+        speedReader?.show(initialWpm: config.wpm, audioOn: config.speedReadAudio)
+    }
+
     @objc private func editSentencePause() {
         NSApp.setActivationPolicy(.regular)
         defer { NSApp.setActivationPolicy(.accessory) }
@@ -3452,192 +4615,6 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         config.save()
         rebuildMenu()
         scheduleRespeak()
-    }
-
-    // MARK: - Opt-in dictation corrections (text only, never audio)
-    //
-    // When the user fixes a transcript on the review card and has opted in,
-    // the (original, corrected) pair plus word confidences is appended to a
-    // local JSONL log and uploaded in batches. The log IS the disclosure:
-    // everything ever sent can be read from the menu (View Shared Data…).
-
-    private static let correctionsModel = "parakeet-tdt-0.6b-v2"
-    private let correctionsQueue = DispatchQueue(label: "ogma.corrections", qos: .utility)
-
-    private var correctionsLogPath: String {
-        (ogmaDataDir as NSString).appendingPathComponent("corrections.jsonl")
-    }
-    private var correctionsOffsetPath: String {
-        (ogmaDataDir as NSString).appendingPathComponent("corrections.uploaded")
-    }
-    private var correctionsEndpoint: URL {
-        let env = ProcessInfo.processInfo.environment["OGMA_CORRECTIONS_URL"]
-        return URL(string: env ?? "https://stoverdistributed.com/api/ogma/corrections")!
-    }
-
-    /// Random, meaningless UUID so corrections from one install can be
-    /// grouped during analysis. Contains no user or machine information.
-    private func correctionsInstallID() -> String {
-        let path = (configDir as NSString).appendingPathComponent("install-id")
-        if let id = try? String(contentsOfFile: path, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty { return id }
-        let id = UUID().uuidString
-        try? FileManager.default.createDirectory(
-            atPath: configDir, withIntermediateDirectories: true)
-        try? id.write(toFile: path, atomically: true, encoding: .utf8)
-        return id
-    }
-
-    private func recordCorrectionIfEnabled(final: String) {
-        guard config.shareCorrections else { return }
-        let original = overlay.reviewOriginalText
-        let words = overlay.reviewOriginalWords
-
-        func norm(_ s: String) -> String {
-            s.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        }
-        // Only actual corrections are shared — untouched transcripts stay
-        // on this machine.
-        guard !original.isEmpty, norm(original) != norm(final) else { return }
-
-        let record: [String: Any] = [
-            "ts": ISO8601DateFormatter().string(from: Date()),
-            "app": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
-            "model": Self.correctionsModel,
-            "install": correctionsInstallID(),
-            "original": original,
-            "final": final,
-            "words": words.map { ["t": $0.text, "c": ($0.confidence * 1000).rounded() / 1000] },
-        ]
-        correctionsQueue.async { [self] in
-            guard let data = try? JSONSerialization.data(withJSONObject: record) else { return }
-            let fm = FileManager.default
-            try? fm.createDirectory(atPath: ogmaDataDir, withIntermediateDirectories: true)
-            if !fm.fileExists(atPath: correctionsLogPath) {
-                fm.createFile(atPath: correctionsLogPath, contents: nil)
-            }
-            if let handle = FileHandle(forWritingAtPath: correctionsLogPath) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.write(Data([0x0A]))
-                handle.closeFile()
-            }
-            drainCorrectionsLocked()
-        }
-    }
-
-    func uploadPendingCorrections() {
-        correctionsQueue.async { [self] in drainCorrectionsLocked() }
-    }
-
-    /// Upload up to 100 not-yet-sent log lines; advance the byte offset on
-    /// success. Must run on correctionsQueue. Failures just wait for the
-    /// next dictation or launch.
-    private func drainCorrectionsLocked() {
-        guard let fileData = FileManager.default.contents(atPath: correctionsLogPath) else { return }
-        let offset = Int((try? String(contentsOfFile: correctionsOffsetPath, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
-        guard offset < fileData.count else { return }
-
-        let pending = fileData.subdata(in: offset..<fileData.count)
-        var records: [[String: Any]] = []
-        var consumed = 0
-        var cursor = 0
-        while records.count < 100 {
-            guard let nl = pending[cursor...].firstIndex(of: 0x0A) else { break }
-            let line = pending.subdata(in: cursor..<nl)
-            if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
-                records.append(obj)
-            }
-            cursor = nl + 1
-            consumed = cursor
-        }
-        guard !records.isEmpty,
-              let body = try? JSONSerialization.data(withJSONObject: ["records": records]) else { return }
-
-        var request = URLRequest(url: correctionsEndpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
-        request.timeoutInterval = 15
-
-        var ok = false
-        let sem = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { _, response, _ in
-            if let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
-                ok = true
-            }
-            sem.signal()
-        }.resume()
-        sem.wait()
-
-        if ok {
-            try? String(offset + consumed)
-                .write(toFile: correctionsOffsetPath, atomically: true, encoding: .utf8)
-            // More than one batch pending? Keep draining.
-            if offset + consumed < fileData.count { drainCorrectionsLocked() }
-        }
-    }
-
-    private static let correctionsDisclosure = """
-        When you fix a transcript on the review card, Ogma sends the correction to Stover Distributed so we can analyze where recognition goes wrong and improve it.
-
-        Each report contains only:
-        • the text the model heard
-        • the text you corrected it to
-        • per-word confidence scores
-        • a random anonymous install ID
-
-        Audio is never recorded or sent. Dictations you don't correct are never sent. Everything shared is kept in a local log you can read anytime (View Shared Data…), and you can turn this off whenever you like.
-        """
-
-    private func buildImproveDictationItems() -> [NSMenuItem] {
-        let share = NSMenuItem(title: "Share Corrections",
-                               action: #selector(toggleShareCorrections), keyEquivalent: "")
-        share.target = self
-        share.state = config.shareCorrections ? .on : .off
-        let what = NSMenuItem(title: "What Gets Shared\u{2026}",
-                              action: #selector(showWhatGetsShared), keyEquivalent: "")
-        what.target = self
-        let view = NSMenuItem(title: "View Shared Data\u{2026}",
-                              action: #selector(viewSharedCorrections), keyEquivalent: "")
-        view.target = self
-        return [share, what, view]
-    }
-
-    @objc private func toggleShareCorrections() {
-        if config.shareCorrections {
-            config.shareCorrections = false
-            config.save()
-            rebuildMenu()
-            return
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        let a = NSAlert()
-        a.messageText = "Share Dictation Corrections?"
-        a.informativeText = Self.correctionsDisclosure
-        a.addButton(withTitle: "Share Corrections")
-        a.addButton(withTitle: "Cancel")
-        guard a.runModal() == .alertFirstButtonReturn else { return }
-        config.shareCorrections = true
-        config.save()
-        rebuildMenu()
-    }
-
-    @objc private func showWhatGetsShared() {
-        showNote("What Gets Shared", Self.correctionsDisclosure)
-    }
-
-    @objc private func viewSharedCorrections() {
-        guard FileManager.default.fileExists(atPath: correctionsLogPath) else {
-            showNote("No Data Yet",
-                     "Nothing has been collected. Corrections are logged here only after you turn on Share Corrections and fix a transcript on the review card.")
-            return
-        }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments = ["-e", correctionsLogPath]
-        try? task.run()
     }
 
     // MARK: - Credits Display
@@ -3804,6 +4781,10 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
 }
 
 // MARK: - Entry point
+
+if CommandLine.arguments.contains("--self-test-pasteboard-snapshot") {
+    exit(runPasteboardSnapshotSelfTest() ? EXIT_SUCCESS : EXIT_FAILURE)
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
