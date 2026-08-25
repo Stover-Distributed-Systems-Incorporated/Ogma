@@ -99,12 +99,12 @@ Click the **waveform icon** in the menu bar. The menu adapts to your setup — y
 
 Press `⌥⇧D` to start dictating anywhere. The default **Detailed** recording indicator shows the live transcript as you speak. Press `⌥⇧D` again to stop; when **Review before insert** is enabled, the final transcript appears in an interactive review card:
 
-- **✓ Insert** (`Return`) — paste the transcript at your cursor. Click into another app first to redirect it there.
+- **✓ Insert** (`Return`) — insert the transcript at your cursor using the selected **Insert Method**. Click into another app first to redirect it there.
 - **Edit** — just click the text and type; your edits show in gray so you can tell them apart from the transcription. `Shift+Return` adds a newline.
 - **✗ Discard** (`Esc`) — throw it away.
 - **`⌥⇧D` again** — dictate *more*, straight into the transcript at the cursor (to re-record from scratch, discard first).
 
-Words the model wasn't sure about are tinted **yellow** (uncertain) or **red + underlined** (probably wrong), so you can spot-check exactly the shaky parts before inserting. Click a highlighted word and a tiny **✓ / ✕** chip pops up — keep it or cut it with one click. When a phonetically similar word fits the sentence context much better, the chip also offers a one-click **↻ replacement** (classic n-gram autocorrect — local, no LLM, and it never rewrites anything on its own). You can even select text in the card and press `⌥⇧/` to hear it. If the paste target disappears, the transcript is copied to the clipboard instead — it is never lost.
+Words the model wasn't sure about are tinted **yellow** (uncertain) or **red + underlined** (probably wrong), so you can spot-check exactly the shaky parts before inserting. Click a highlighted word and a tiny **✓ / ✕** chip pops up — keep it or cut it with one click. When a phonetically similar word fits the sentence context much better, the chip also offers a one-click **↻ replacement** (classic n-gram autocorrect — local, no LLM, and it never rewrites anything on its own). You can even select text in the card and press `⌥⇧/` to hear it. If the insertion target disappears, the transcript is copied to the clipboard instead — it is never lost.
 
 Filler words (*um, uh, er, hmm…*) are removed automatically — they never even appear in the live transcript, and capitalization is repaired where they're dropped. Set `FILTER_FILLERS="false"` in `~/.config/ogma/config` if you want them kept.
 
@@ -116,7 +116,8 @@ Filler words (*um, uh, er, hmm…*) are removed automatically — they never eve
 |---------|---------|
 | **STT Engine** | Parakeet (fast, default) or Voxtral (best accuracy — better grammar and punctuation, ~3.5 GB in memory while loaded). |
 | **Recording Indicator** | **None:** animated menu-bar waveform only. **Simple:** animated menu-bar waveform plus a compact speech-responsive audio meter and Stop Recording button. **Detailed** (default): the existing live transcript card. |
-| **Review before insert** | On (default) — show the review card when dictation stops. Off — paste immediately, as if the card didn't exist. |
+| **Review before insert** | On (default) — show the review card when dictation stops. Off — insert immediately, as if the card didn't exist. |
+| **Insert Method** | **Paste all at once** (default), or type the transcript as ordinary key events at 60, 120, 240, or a custom WPM. Paced typing helps web editors that mishandle a large paste event. |
 | **Auto-unload after** | How long the speech model stays in memory after the last dictation (default 2 minutes). |
 
 ### Playback settings
@@ -216,6 +217,8 @@ STT_IDLE_TIMEOUT="120"
 STT_ENGINE="parakeet"
 STT_ENGINES_INSTALLED="parakeet"
 DICTATION_REVIEW="true"
+DICTATION_INSERT_MODE="paste"
+DICTATION_TYPING_WPM="120"
 RECORDING_INDICATOR="detailed"
 SENTENCE_PAUSE="400"
 ```

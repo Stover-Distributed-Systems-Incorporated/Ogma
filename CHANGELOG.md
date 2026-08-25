@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Features
+
+- **Dictation can now type instead of paste.** The new **Insert Method** menu offers the existing all-at-once paste plus paced Unicode typing at 60, 120, 240, or a custom WPM. Typed insertion avoids duplicate output in web editors that mishandle large paste events, does not disturb the clipboard on success, and falls back to copying the full transcript if focus becomes unsafe.
+
+### Bug fixes
+
+- **The recording indicator (and the dictation card / speed-read overlay) no longer disappear behind particular windows, full-screen apps, or Stage Manager sets.** Overlay panels now use macOS's cross-application overlay behavior, resolve the frontmost app's focused window to the correct display instead of relying solely on `NSScreen.main`, refresh across app/Space/display transitions, and reassert visibility while recording. Positioning still falls back safely and remains clamped on-screen.
+
 ## v2.3.0
 
 ### Bug fixes

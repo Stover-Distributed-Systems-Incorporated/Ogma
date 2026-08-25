@@ -76,6 +76,11 @@ struct Config {
     // of pasting the transcript immediately when recording stops.
     var dictationReview: Bool   = true
 
+    // Dictation insertion: paste the transcript in one operation (default),
+    // or synthesize ordinary Unicode key events at the selected typing rate.
+    var dictationInsertMode: String = "paste"   // "paste" or "type"
+    var dictationTypingWPM:  Int    = 120
+
     // Live recording presentation: "none" (menu-bar waveform only), "simple"
     // (compact audio meter), or "detailed" (live transcript card).
     var recordingIndicator: String = "detailed"
@@ -131,6 +136,12 @@ struct Config {
             case "STT_ENGINE":           c.sttEngine          = value
             case "STT_ENGINES_INSTALLED": c.sttEnginesInstalled = value
             case "DICTATION_REVIEW":     c.dictationReview    = value != "false" && value != "0"
+            case "DICTATION_INSERT_MODE":
+                if ["paste", "type"].contains(value) { c.dictationInsertMode = value }
+            case "DICTATION_TYPING_WPM":
+                if let wpm = Int(value), (1...2000).contains(wpm) {
+                    c.dictationTypingWPM = wpm
+                }
             case "RECORDING_INDICATOR":
                 if ["none", "simple", "detailed"].contains(value) {
                     c.recordingIndicator = value
@@ -167,6 +178,8 @@ struct Config {
             "STT_ENGINE=\"\(sttEngine)\"",
             "STT_ENGINES_INSTALLED=\"\(sttEnginesInstalled)\"",
             "DICTATION_REVIEW=\"\(dictationReview ? "true" : "false")\"",
+            "DICTATION_INSERT_MODE=\"\(dictationInsertMode)\"",
+            "DICTATION_TYPING_WPM=\"\(dictationTypingWPM)\"",
             "RECORDING_INDICATOR=\"\(recordingIndicator)\"",
             "SENTENCE_PAUSE=\"\(sentencePause)\"",
             "WPM=\"\(wpm)\"",
@@ -237,6 +250,10 @@ private let localSpeedSteps: [(label: String, value: Double)] = [
 private let idleTimeoutSteps: [(label: String, value: Int)] = [
     ("2 minutes", 120), ("5 minutes", 300), ("10 minutes", 600), ("30 minutes", 1800),
 ]
+
+// Standard typing-speed convention: one word is five characters (including
+// spaces). Custom values are also accepted through the menu.
+private let dictationTypingSpeedSteps: [Int] = [60, 120, 240]
 
 private let stabilitySteps: [(label: String, value: Double)] = [
     ("0.0 — expressive", 0.0), ("0.25", 0.25), ("0.5 — default", 0.5),
@@ -924,7 +941,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
     // fixed bottom edge as the text wraps, capped at 40% of the screen;
     // beyond that the text scrolls vertically.
     private func relayout() {
-        guard let panel = panel, let tv = textView, let screen = NSScreen.main else { return }
+        guard let panel = panel, let tv = textView, let screen = overlayScreen() else { return }
         let vf = screen.visibleFrame
         let panelW = min(Self.panelWidth, vf.width - 80)
         // Margins + container inset + the text container's default 5pt
@@ -957,6 +974,26 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
             let hintX = discard.frame.maxX + 12
             hint.frame = NSRect(x: hintX, y: (barH - 16) / 2,
                                 width: max(0, insert.frame.minX - 12 - hintX), height: 16)
+        }
+    }
+
+    // Re-run the geometry pass if the card is currently showing — called when
+    // the display configuration changes and the card's frame may have landed
+    // on a screen that no longer exists.
+    func relayoutIfVisible() {
+        DispatchQueue.main.async {
+            guard let panel = self.panel, panel.isVisible else { return }
+            self.relayout()
+            // A panel may remain isVisible while another app's full-screen or
+            // Stage Manager transition has moved it out of the visible set.
+            panel.orderFrontRegardless()
+        }
+    }
+
+    func reassertVisibilityIfVisible() {
+        DispatchQueue.main.async {
+            guard let panel = self.panel, panel.isVisible else { return }
+            panel.orderFrontRegardless()
         }
     }
 
@@ -1006,7 +1043,7 @@ final class DictationOverlay: NSObject, NSTextViewDelegate {
         panel.isOpaque = false
         panel.hasShadow = true
         panel.ignoresMouseEvents = true          // click-through; never steals focus
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel.collectionBehavior = overlayCollectionBehavior
         // NSPanel hides itself when the app deactivates by default. Ogma can
         // be the active app while the card is up (menu-bar menu, dictionary
         // editor), and switching apps then made the card vanish mid-recording.
@@ -1800,7 +1837,7 @@ private final class RSVPOverlay: NSObject {
         p.isOpaque = false
         p.hasShadow = true
         p.ignoresMouseEvents = true                 // click-through; never steals focus
-        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        p.collectionBehavior = overlayCollectionBehavior
         p.hidesOnDeactivate = false
 
         let bg = NSVisualEffectView(frame: p.contentView!.bounds)
@@ -1823,10 +1860,21 @@ private final class RSVPOverlay: NSObject {
     }
 
     private func position() {
-        guard let panel = panel, let screen = NSScreen.main else { return }
+        guard let panel = panel, let screen = overlayScreen() else { return }
         let vf = screen.visibleFrame
         panel.setFrame(NSRect(x: vf.midX - Self.width / 2, y: vf.midY - Self.height / 2,
                               width: Self.width, height: Self.height), display: true)
+    }
+
+    // Re-run positioning if the panel is currently showing — called when the
+    // display configuration changes and the panel's frame may have landed on
+    // a screen that no longer exists.
+    func repositionIfVisible() {
+        DispatchQueue.main.async {
+            guard let panel = self.panel, panel.isVisible else { return }
+            self.position()
+            panel.orderFrontRegardless()
+        }
     }
 
     private func showWord() {
@@ -1856,6 +1904,78 @@ private final class RSVPOverlay: NSObject {
         }
         showWord()
     }
+}
+
+// Overlay panels are cross-application UI. `canJoinAllApplications` is the
+// macOS 13+ behavior Apple provides for floating/system overlays so they can
+// accompany other apps in Stage Manager sets and full-screen Spaces. The
+// older fullScreenAuxiliary + canJoinAllSpaces pair is not equivalent.
+private let overlayCollectionBehavior: NSWindow.CollectionBehavior = [
+    .canJoinAllApplications, .canJoinAllSpaces, .stationary,
+    .fullScreenAuxiliary, .ignoresCycle,
+]
+
+// Accessibility reports focused-window bounds in the same upper-left global
+// coordinate space as CGDisplayBounds. Resolve the actual target app's window
+// to a display instead of assuming NSScreen.main belongs to it; accessory/menu
+// bar apps and multi-display full-screen layouts can make that assumption
+// stale or simply wrong.
+private func screenForFocusedWindow(pid: pid_t) -> NSScreen? {
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.08)
+    var windowValue: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(
+            app, kAXFocusedWindowAttribute as CFString, &windowValue) == .success,
+          let rawWindow = windowValue,
+          CFGetTypeID(rawWindow) == AXUIElementGetTypeID() else { return nil }
+    let window = rawWindow as! AXUIElement
+    AXUIElementSetMessagingTimeout(window, 0.08)
+
+    var positionValue: CFTypeRef?
+    var sizeValue: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(
+            window, kAXPositionAttribute as CFString, &positionValue) == .success,
+          AXUIElementCopyAttributeValue(
+            window, kAXSizeAttribute as CFString, &sizeValue) == .success,
+          let rawPosition = positionValue, let rawSize = sizeValue,
+          CFGetTypeID(rawPosition) == AXValueGetTypeID(),
+          CFGetTypeID(rawSize) == AXValueGetTypeID() else { return nil }
+
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(rawPosition as! AXValue, .cgPoint, &position),
+          AXValueGetValue(rawSize as! AXValue, .cgSize, &size),
+          size.width > 0, size.height > 0 else { return nil }
+    let windowFrame = CGRect(origin: position, size: size)
+
+    var best: (screen: NSScreen, area: CGFloat)?
+    let screenNumberKey = NSDeviceDescriptionKey("NSScreenNumber")
+    for screen in NSScreen.screens {
+        guard let number = screen.deviceDescription[screenNumberKey] as? NSNumber else { continue }
+        let displayFrame = CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
+        let overlap = windowFrame.intersection(displayFrame)
+        let area = overlap.isNull ? 0 : overlap.width * overlap.height
+        if area > (best?.area ?? 0) { best = (screen, area) }
+    }
+    return best?.screen
+}
+
+// The screen floating overlays should appear on: the one containing the
+// frontmost app's focused window, then AppKit's keyboard-focused screen, then
+// the pointer's screen, and finally any attached screen.
+private func overlayScreen() -> NSScreen? {
+    let myPid = ProcessInfo.processInfo.processIdentifier
+    if let front = NSWorkspace.shared.frontmostApplication,
+       front.processIdentifier != pid_t(myPid),
+       let target = screenForFocusedWindow(pid: front.processIdentifier) {
+        return target
+    }
+    if let focused = NSScreen.main { return focused }
+    let mouse = NSEvent.mouseLocation
+    if let pointed = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) {
+        return pointed
+    }
+    return NSScreen.screens.first
 }
 
 // MARK: - Compact recording indicator
@@ -1942,7 +2062,7 @@ private final class RecordingIndicatorOverlay: NSObject {
         panel.isOpaque = false
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel.collectionBehavior = overlayCollectionBehavior
 
         let background = NSVisualEffectView(frame: panel.contentView!.bounds)
         background.material = .hudWindow
@@ -1973,10 +2093,33 @@ private final class RecordingIndicatorOverlay: NSObject {
     }
 
     private func position() {
-        guard let panel, let screen = NSScreen.main else { return }
+        guard let panel, let screen = overlayScreen() else { return }
         let visible = screen.visibleFrame
-        panel.setFrameOrigin(NSPoint(x: visible.midX - Self.width / 2,
-                                     y: visible.minY + 120))
+        // Keep the whole panel inside the visible frame even when it's smaller
+        // than expected (tiny displays, aggressive Dock/menu-bar geometry).
+        let x = min(max(visible.midX - Self.width / 2, visible.minX),
+                    max(visible.minX, visible.maxX - Self.width))
+        let y = min(max(visible.minY + 120, visible.minY),
+                    max(visible.minY, visible.maxY - Self.height))
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    // Re-run positioning if the panel is currently showing — called when the
+    // display configuration changes and the panel's frame may have landed on
+    // a screen that no longer exists.
+    func repositionIfVisible() {
+        DispatchQueue.main.async {
+            guard let panel = self.panel, panel.isVisible else { return }
+            self.position()
+            panel.orderFrontRegardless()
+        }
+    }
+
+    func reassertVisibilityIfVisible() {
+        DispatchQueue.main.async {
+            guard let panel = self.panel, panel.isVisible else { return }
+            panel.orderFrontRegardless()
+        }
     }
 }
 
@@ -1987,6 +2130,7 @@ private final class RecordingIndicatorOverlay: NSObject {
     private var config         = Config.load()
     private var accessTimer: Timer?
     private var hotkeyHealthTimer: Timer?
+    private var recordingOverlayHealthTimer: Timer?
     private var wasAXTrusted = false
     private var animTimer:   Timer?
     private var countdownTimer: Timer?
@@ -2034,6 +2178,9 @@ private final class RecordingIndicatorOverlay: NSObject {
     // paste, since the review card takes key focus in between.
     private var dictationTargetApp: NSRunningApplication?
     private let recordLock = NSLock()
+    // Invalidates a paced insertion if a newer one starts. Paced insertion is
+    // scheduled on the main queue so UI and focus checks remain serialized.
+    private var typingGeneration = 0
 
     private var recordingIndicatorMode: RecordingIndicatorMode {
         RecordingIndicatorMode(rawValue: config.recordingIndicator) ?? .detailed
@@ -2055,6 +2202,19 @@ private final class RecordingIndicatorOverlay: NSObject {
         overlay.onInsert = { [weak self] text in self?.completeReview(insert: text) }
         overlay.onDiscard = { [weak self] in self?.completeReview(insert: nil) }
         recordingOverlay.onStop = { [weak self] in self?.stopDictation() }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        // Display changes are not the only way an overlay changes visibility.
+        // Re-home and re-order it when the user enters another Space, switches
+        // Stage Manager sets, or activates a different application.
+        let workspaceNotifications = NSWorkspace.shared.notificationCenter
+        workspaceNotifications.addObserver(
+            self, selector: #selector(workspaceContextChanged(_:)),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        workspaceNotifications.addObserver(
+            self, selector: #selector(workspaceContextChanged(_:)),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil)
         syncBundledResources()
         installHotkey()
         startHotkeyHealthTimer()
@@ -2068,9 +2228,53 @@ private final class RecordingIndicatorOverlay: NSObject {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        recordingOverlayHealthTimer?.invalidate()
         killCurrentProcess()
         stopTTSDaemon()
         stopSTTDaemon()
+    }
+
+    // Displays come and go (docking, lid-close, resolution changes). A visible
+    // overlay's frame can end up on a vanished screen; reposition whatever is
+    // showing. Hidden overlays need no help — position() runs on every show().
+    @objc private func screensChanged() {
+        refreshVisibleOverlays()
+    }
+
+    @objc private func workspaceContextChanged(_ notification: Notification) {
+        refreshVisibleOverlays()
+        // The notification can arrive while Mission Control/Stage Manager is
+        // still finishing its window transaction. Reassert once more after it
+        // settles instead of trusting that first ordering request.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.refreshVisibleOverlays()
+        }
+    }
+
+    private func refreshVisibleOverlays() {
+        recordingOverlay.repositionIfVisible()
+        overlay.relayoutIfVisible()
+        rsvpOverlay?.repositionIfVisible()
+    }
+
+    // A full-screen web view or Stage Manager transition can reorder windows
+    // without producing a reliable AppKit visibility change. While recording,
+    // periodically reassert the panel's order. This deliberately does not run
+    // Accessibility/screen resolution on every tick; those slower operations
+    // remain event-driven above.
+    private func startRecordingOverlayHealthTimer() {
+        recordingOverlayHealthTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in
+            self?.recordingOverlay.reassertVisibilityIfVisible()
+            self?.overlay.reassertVisibilityIfVisible()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        recordingOverlayHealthTimer = timer
+    }
+
+    private func stopRecordingOverlayHealthTimer() {
+        recordingOverlayHealthTimer?.invalidate()
+        recordingOverlayHealthTimer = nil
     }
 
     // Re-read config every time the menu opens so we pick up changes from
@@ -2082,6 +2286,8 @@ private final class RecordingIndicatorOverlay: NSObject {
            fresh.ttsBackend != config.ttsBackend ||
            fresh.sttEnginesInstalled != config.sttEnginesInstalled ||
            fresh.sttEngine != config.sttEngine ||
+           fresh.dictationInsertMode != config.dictationInsertMode ||
+           fresh.dictationTypingWPM != config.dictationTypingWPM ||
            fresh.recordingIndicator != config.recordingIndicator {
             config = fresh
             rebuildMenu()
@@ -2882,6 +3088,7 @@ private final class RecordingIndicatorOverlay: NSObject {
     }
 
     private func stopEngine() {
+        stopRecordingOverlayHealthTimer()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         setDictating(false)
@@ -2895,8 +3102,10 @@ private final class RecordingIndicatorOverlay: NSObject {
             break
         case .simple:
             recordingOverlay.show()
+            startRecordingOverlayHealthTimer()
         case .detailed:
             overlay.beginLiveDictation()
+            startRecordingOverlayHealthTimer()
         }
         let error = startStreamingSession(
             wantsPartials: recordingIndicatorMode == .detailed,
@@ -2909,6 +3118,7 @@ private final class RecordingIndicatorOverlay: NSObject {
                 self?.finishDictation(final: f, words: words)
             })
         if let error = error {
+            stopRecordingOverlayHealthTimer()
             overlay.hide()
             recordingOverlay.hide()
             setDictationState(.idle)
@@ -3154,10 +3364,78 @@ private final class RecordingIndicatorOverlay: NSObject {
         audioConverter = nil
     }
 
+    // Deliver the transcript with the selected method. Paste remains the
+    // default; paced typing avoids the single large paste event that can make
+    // some web editors duplicate dictation output.
+    private func injectText(_ text: String) {
+        typingGeneration &+= 1
+        if config.dictationInsertMode == "type" {
+            typeText(text, generation: typingGeneration)
+        } else {
+            pasteText(text)
+        }
+    }
+
+    // Type one extended grapheme cluster per key event. WPM follows the
+    // conventional five-characters-per-word definition, including spaces.
+    // If focus moves or secure input starts, stop immediately and put the full
+    // transcript on the clipboard so no words are lost.
+    private func typeText(_ text: String, generation: Int) {
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        guard let targetPid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              targetPid != pid_t(myPid),
+              !IsSecureEventInputEnabled(),
+              let source = CGEventSource(stateID: .hidSystemState) else {
+            copyTranscriptFallback(text)
+            return
+        }
+        let characters = Array(text)
+        let wpm = min(max(config.dictationTypingWPM, 1), 2000)
+        let interval = 60.0 / (Double(wpm) * 5.0)
+        typeNextCharacter(characters, at: 0, originalText: text,
+                          targetPid: targetPid, source: source,
+                          interval: interval, generation: generation)
+    }
+
+    private func typeNextCharacter(_ characters: [Character], at index: Int,
+                                   originalText: String, targetPid: pid_t,
+                                   source: CGEventSource, interval: TimeInterval,
+                                   generation: Int) {
+        guard generation == typingGeneration else { return }
+        guard index < characters.count else { return }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid,
+              !IsSecureEventInputEnabled() else {
+            copyTranscriptFallback(originalText)
+            return
+        }
+
+        let utf16 = Array(String(characters[index]).utf16)
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+            copyTranscriptFallback(originalText)
+            return
+        }
+        utf16.withUnsafeBufferPointer { buffer in
+            guard let address = buffer.baseAddress else { return }
+            keyDown.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: address)
+            keyUp.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: address)
+        }
+        keyDown.post(tap: .cgAnnotatedSessionEventTap)
+        keyUp.post(tap: .cgAnnotatedSessionEventTap)
+
+        let next = index + 1
+        guard next < characters.count else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
+            self?.typeNextCharacter(characters, at: next, originalText: originalText,
+                                    targetPid: targetPid, source: source,
+                                    interval: interval, generation: generation)
+        }
+    }
+
     // Insert transcribed text via the pasteboard + ⌘V. Restore every original
     // pasteboard type only after observing the text in a real editable AX
     // target; otherwise retain the transcript for a reliable manual paste.
-    private func injectText(_ text: String) {
+    private func pasteText(_ text: String) {
         let pb = NSPasteboard.general
         let savedItems = snapshotPasteboardItems(pb.pasteboardItems ?? [])
         let targetPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -3487,6 +3765,9 @@ private final class RecordingIndicatorOverlay: NSObject {
             review.state = config.dictationReview ? .on : .off
             menu.addItem(review)
 
+            menu.addItem(submenuItem("Insert Method",
+                                     items: buildDictationInsertItems()))
+
             let dict = NSMenuItem(title: "Dictionary\u{2026}",
                                   action: #selector(editDictionary), keyEquivalent: "")
             dict.target = self
@@ -3604,6 +3885,28 @@ private final class RecordingIndicatorOverlay: NSObject {
             item("Detailed \u{2014} live transcript", #selector(pickRecordingIndicator(_:)),
                  repr: "detailed", on: recordingIndicatorMode == .detailed),
         ]
+    }
+
+    private func buildDictationInsertItems() -> [NSMenuItem] {
+        var items = [
+            item("Paste all at once", #selector(pickDictationInsert(_:)),
+                 repr: "paste", on: config.dictationInsertMode == "paste"),
+            NSMenuItem.separator(),
+        ]
+        items += dictationTypingSpeedSteps.map { wpm in
+            item("Type at \(wpm) WPM", #selector(pickDictationInsert(_:)),
+                 repr: "type:\(wpm)",
+                 on: config.dictationInsertMode == "type" && config.dictationTypingWPM == wpm)
+        }
+        items.append(.separator())
+        let isCustom = config.dictationInsertMode == "type"
+            && !dictationTypingSpeedSteps.contains(config.dictationTypingWPM)
+        let customTitle = isCustom
+            ? "Custom: \(config.dictationTypingWPM) WPM\u{2026}"
+            : "Custom typing speed\u{2026}"
+        items.append(item(customTitle, #selector(customDictationTypingSpeed),
+                          repr: "", on: isCustom))
+        return items
     }
 
     private func buildSttIdleTimeoutItems() -> [NSMenuItem] {
@@ -4456,6 +4759,49 @@ private final class RecordingIndicatorOverlay: NSObject {
               RecordingIndicatorMode(rawValue: value) != nil,
               value != config.recordingIndicator else { return }
         config.recordingIndicator = value
+        config.save()
+        rebuildMenu()
+    }
+
+    @objc private func pickDictationInsert(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String else { return }
+        if value == "paste" {
+            config.dictationInsertMode = "paste"
+        } else if value.hasPrefix("type:"),
+                  let wpm = Int(value.dropFirst("type:".count)),
+                  (1...2000).contains(wpm) {
+            config.dictationInsertMode = "type"
+            config.dictationTypingWPM = wpm
+        } else {
+            return
+        }
+        config.save()
+        rebuildMenu()
+    }
+
+    @objc private func customDictationTypingSpeed() {
+        NSApp.setActivationPolicy(.regular)
+        defer { NSApp.setActivationPolicy(.accessory) }
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Typing Speed"
+        alert.informativeText = "Enter a speed from 1 to 2,000 words per minute. Ogma uses the standard five characters per word."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 22))
+        field.stringValue = String(config.dictationTypingWPM)
+        field.placeholderString = "e.g. 120"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let wpm = Int(text), (1...2000).contains(wpm) else {
+            NSSound.beep()
+            return
+        }
+        config.dictationInsertMode = "type"
+        config.dictationTypingWPM = wpm
         config.save()
         rebuildMenu()
     }

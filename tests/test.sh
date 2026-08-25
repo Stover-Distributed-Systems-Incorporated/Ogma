@@ -464,6 +464,72 @@ check "Swift: Detailed alone opens and updates the live transcript card" \
              awk '/private func beginRecording/,/^    \}/' "$SETTINGS_SWIFT" | \
              grep -q 'recordingIndicatorMode == .detailed' && echo yes || echo no)"
 
+# Floating overlay screen selection: NSScreen.main alone is nil whenever no
+# window has keyboard focus, which stranded overlays at stale (possibly
+# off-screen) frames. They must fall back to an attached screen.
+check "Swift: overlayScreen helper prefers focused screen, falls back beyond NSScreen.main" \
+    "yes" "$(grep -q 'private func overlayScreen() -> NSScreen?' "$SETTINGS_SWIFT" && \
+             awk '/private func overlayScreen\(\)/,/^}/' "$SETTINGS_SWIFT" | \
+             grep -q 'NSScreen.main' && \
+             awk '/private func overlayScreen\(\)/,/^}/' "$SETTINGS_SWIFT" | \
+             grep -q 'NSScreen.screens.first' && echo yes || echo no)"
+
+check "Swift: dictation card relayout positions via overlayScreen()" \
+    "yes" "$(awk '/final class DictationOverlay/,/^}/' "$SETTINGS_SWIFT" | \
+             awk '/private func relayout\(\)/,/^    \}/' | \
+             grep -q 'overlayScreen()' && echo yes || echo no)"
+
+check "Swift: RSVP overlay position() uses overlayScreen()" \
+    "yes" "$(awk '/final class RSVPOverlay/,/^}/' "$SETTINGS_SWIFT" | \
+             awk '/private func position\(\)/,/^    \}/' | \
+             grep -q 'overlayScreen()' && echo yes || echo no)"
+
+check "Swift: recording indicator position() uses overlayScreen() and clamps on-screen" \
+    "yes" "$(awk '/final class RecordingIndicatorOverlay/,/^}/' "$SETTINGS_SWIFT" | \
+             awk '/private func position\(\)/,/^    \}/' | \
+             grep -q 'overlayScreen()' && \
+             awk '/final class RecordingIndicatorOverlay/,/^}/' "$SETTINGS_SWIFT" | \
+             awk '/private func position\(\)/,/^    \}/' | \
+             grep -q 'min(max(' && echo yes || echo no)"
+
+check "Swift: no overlay positions by guarding on NSScreen.main directly" \
+    "yes" "$(! grep -q 'guard let.*NSScreen\.main' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Swift: visible overlays reposition on display reconfiguration" \
+    "yes" "$(grep -q 'didChangeScreenParametersNotification' "$SETTINGS_SWIFT" && \
+             grep -q 'func repositionIfVisible' "$SETTINGS_SWIFT" && \
+             grep -q 'func relayoutIfVisible' "$SETTINGS_SWIFT" && \
+             grep -q 'isVisible' "$SETTINGS_SWIFT" && \
+             awk '/func screensChanged/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'refreshVisibleOverlays' && \
+             awk '/func refreshVisibleOverlays/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'repositionIfVisible' && \
+             awk '/func refreshVisibleOverlays/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'relayoutIfVisible' && echo yes || echo no)"
+
+check "Swift: overlays join other apps in Stage Manager and full-screen Spaces" \
+    "yes" "$(grep -q 'overlayCollectionBehavior.*NSWindow.CollectionBehavior' "$SETTINGS_SWIFT" && \
+             awk '/overlayCollectionBehavior.*NSWindow.CollectionBehavior/,/^]/' "$SETTINGS_SWIFT" | \
+             grep -q 'canJoinAllApplications' && \
+             [ "$(grep -c 'collectionBehavior = overlayCollectionBehavior' "$SETTINGS_SWIFT")" -eq 3 ] && echo yes || echo no)"
+
+check "Swift: overlay screen follows the frontmost app focused window" \
+    "yes" "$(grep -q 'func screenForFocusedWindow(pid: pid_t)' "$SETTINGS_SWIFT" && \
+             awk '/private func screenForFocusedWindow/,/^}/' "$SETTINGS_SWIFT" | \
+             grep -q 'kAXFocusedWindowAttribute' && \
+             awk '/private func screenForFocusedWindow/,/^}/' "$SETTINGS_SWIFT" | \
+             grep -q 'CGDisplayBounds' && \
+             awk '/private func overlayScreen\(\)/,/^}/' "$SETTINGS_SWIFT" | \
+             grep -q 'screenForFocusedWindow' && echo yes || echo no)"
+
+check "Swift: overlays self-heal across app and Space transitions" \
+    "yes" "$(grep -q 'activeSpaceDidChangeNotification' "$SETTINGS_SWIFT" && \
+             grep -q 'didActivateApplicationNotification' "$SETTINGS_SWIFT" && \
+             grep -q 'startRecordingOverlayHealthTimer' "$SETTINGS_SWIFT" && \
+             grep -q 'reassertVisibilityIfVisible' "$SETTINGS_SWIFT" && \
+             awk '/func relayoutIfVisible/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'orderFrontRegardless' && echo yes || echo no)"
+
 _menu_order_ok=$(python3 - "$SETTINGS_SWIFT" <<'PYEOF'
 import sys
 s = open(sys.argv[1], encoding="utf-8").read()
@@ -2274,6 +2340,29 @@ check "Ogma.swift: paste verified; transcript falls back to clipboard" \
              grep -q 'current.value.contains(text)' "$SETTINGS_SWIFT" && \
              grep -q 'snapshotPasteboardItems' "$SETTINGS_SWIFT" && \
              ! grep -q '\\.copy() as? NSPasteboardItem' "$SETTINGS_SWIFT" && echo "yes" || echo "no")"
+
+check "Ogma.swift: dictation insert mode and typing speed persist" \
+    "yes" "$(grep -q 'var dictationInsertMode.*paste' "$SETTINGS_SWIFT" && \
+             grep -q 'var dictationTypingWPM.*120' "$SETTINGS_SWIFT" && \
+             grep -q 'case "DICTATION_INSERT_MODE"' "$SETTINGS_SWIFT" && \
+             grep -q 'case "DICTATION_TYPING_WPM"' "$SETTINGS_SWIFT" && \
+             grep -q 'DICTATION_INSERT_MODE=.*dictationInsertMode' "$SETTINGS_SWIFT" && \
+             grep -q 'DICTATION_TYPING_WPM=.*dictationTypingWPM' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Ogma.swift: Insert Method menu offers paste, preset WPM, and custom WPM" \
+    "yes" "$(grep -q 'submenuItem("Insert Method"' "$SETTINGS_SWIFT" && \
+             grep -q 'Paste all at once' "$SETTINGS_SWIFT" && \
+             grep -q 'dictationTypingSpeedSteps.*60, 120, 240' "$SETTINGS_SWIFT" && \
+             grep -q 'Custom typing speed' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Ogma.swift: paced typing emits Unicode key events and guards focus" \
+    "yes" "$(grep -q 'config.dictationInsertMode == "type"' "$SETTINGS_SWIFT" && \
+             grep -q 'func typeNextCharacter' "$SETTINGS_SWIFT" && \
+             grep -q 'keyboardSetUnicodeString' "$SETTINGS_SWIFT" && \
+             awk '/private func typeNextCharacter/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'frontmostApplication' && \
+             awk '/private func typeNextCharacter/,/^    \}/' "$SETTINGS_SWIFT" | \
+             grep -q 'copyTranscriptFallback' && echo yes || echo no)"
 
 check "speak.sh: reads config without executing it" \
     "yes" "$(grep -q '_config_value()' "$SCRIPT_DIR/speak.sh" && \
