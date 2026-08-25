@@ -623,6 +623,11 @@ if [ "$settings_result" = "Install" ]; then
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Ogma uses the microphone for local dictation (speech to text).</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
 </dict>

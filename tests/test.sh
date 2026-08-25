@@ -572,6 +572,8 @@ else
         check "binary is executable"    "yes" "$( [ -x "$TMPBIN" ] && echo yes || echo no )"
         check "clipboard snapshot runtime regression" \
             "yes" "$( "$TMPBIN" --self-test-pasteboard-snapshot && echo yes || echo no )"
+        check "intent rewrite request/response runtime regression" \
+            "yes" "$( "$TMPBIN" --self-test-intent-rewrite && echo yes || echo no )"
         rm -f "$TMPBIN"
     else
         check "compiles without errors" "yes" "no"
@@ -2363,6 +2365,33 @@ check "Ogma.swift: paced typing emits Unicode key events and guards focus" \
              grep -q 'frontmostApplication' && \
              awk '/private func typeNextCharacter/,/^    \}/' "$SETTINGS_SWIFT" | \
              grep -q 'copyTranscriptFallback' && echo yes || echo no)"
+
+check "Ogma.swift: intent rewrite providers and settings persist" \
+    "yes" "$(grep -q 'enum IntentRewriteProvider' "$SETTINGS_SWIFT" && \
+             grep -q 'INTENT_REWRITE_PROVIDER' "$SETTINGS_SWIFT" && \
+             grep -q 'INTENT_OPENAI_MODEL' "$SETTINGS_SWIFT" && \
+             grep -q 'INTENT_ANTHROPIC_MODEL' "$SETTINGS_SWIFT" && \
+             grep -q 'INTENT_COMPATIBLE_URL' "$SETTINGS_SWIFT" && \
+             grep -q 'submenuItem("Intent Rewrite"' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Ogma.swift: intent rewrite uses provider-native APIs and safe fallback" \
+    "yes" "$(grep -q 'api.openai.com/v1/responses' "$SETTINGS_SWIFT" && \
+             grep -q 'api.anthropic.com/v1/messages' "$SETTINGS_SWIFT" && \
+             grep -q '/chat/completions' "$SETTINGS_SWIFT" && \
+             grep -q '"store": false' "$SETTINGS_SWIFT" && \
+             grep -q 'case .failure' "$SETTINGS_SWIFT" && \
+             grep -q 'using original' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Ogma.swift: intent rewrite keys stay in Keychain" \
+    "yes" "$(grep -q 'ogma-intent-openai-api-key' "$SETTINGS_SWIFT" && \
+             grep -q 'ogma-intent-anthropic-api-key' "$SETTINGS_SWIFT" && \
+             grep -q 'ogma-intent-compatible-api-key' "$SETTINGS_SWIFT" && \
+             ! grep -q 'INTENT_.*API_KEY=' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "packaging permits local intent endpoints without weakening remote transport" \
+    "yes" "$(grep -q 'NSAllowsLocalNetworking' "$SCRIPT_DIR/install.command" && \
+             grep -q 'NSAllowsLocalNetworking' "$SCRIPT_DIR/build-pkg.sh" && \
+             grep -q 'Remote compatible endpoints must use HTTPS' "$SETTINGS_SWIFT" && echo yes || echo no)"
 
 check "speak.sh: reads config without executing it" \
     "yes" "$(grep -q '_config_value()' "$SCRIPT_DIR/speak.sh" && \

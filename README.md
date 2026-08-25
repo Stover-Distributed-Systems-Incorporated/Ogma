@@ -40,6 +40,7 @@ Ogma is a **fork of [Speak11](https://speakeleven.com)** — Speak11 remains its
 - macOS Ventura (13) or later
 - **Cloud TTS:** a free [ElevenLabs account](https://elevenlabs.io) and API key
 - **Local TTS:** Apple Silicon (M1 or later) — Python is downloaded automatically if needed
+- **Optional Intent Rewrite:** an OpenAI or Anthropic API key, or any local/remote OpenAI-compatible server
 
 ## Installation
 
@@ -70,7 +71,7 @@ The waveform icon pulses while audio is being generated and played, so you alway
 
 Text copied from PDFs, LaTeX documents, and Markdown files is automatically cleaned up before reading -- math equations, SI units, Greek letters, citations, and formatting artifacts are converted to natural spoken language.
 
-Your API key is stored in your macOS Keychain — never written to a file. Dictation audio and transcripts are processed entirely on your machine and are never uploaded.
+API keys are stored separately in your macOS Keychain — never written to the config file. Speech recognition and audio always remain on your Mac. Dictation transcripts also remain local by default; enabling a remote **Intent Rewrite** provider sends only the final transcript text to that provider, after an explicit disclosure in the settings dialog.
 
 ## Settings
 
@@ -108,6 +109,10 @@ Words the model wasn't sure about are tinted **yellow** (uncertain) or **red + u
 
 Filler words (*um, uh, er, hmm…*) are removed automatically — they never even appear in the live transcript, and capitalization is repaired where they're dropped. Set `FILTER_FILLERS="false"` in `~/.config/ogma/config` if you want them kept.
 
+**Intent Rewrite (optional):** after local speech recognition finishes, Ogma can ask an LLM to produce the text you meant to write. It resolves spoken revisions and false starts—for example, *“Today I got ice cream—no, wait—licorice”* becomes *“Today I got licorice.”*—while preserving meaning instead of answering or acting on the dictated text. Choose **OpenAI**, **Anthropic**, or **OpenAI-compatible (local or remote)**. Provider, model, endpoint, timeout, and credentials are configurable; keys stay in Keychain. OpenAI requests use the Responses API with storage disabled. Local servers default to Ollama's `http://127.0.0.1:11434/v1` compatibility endpoint, but LM Studio and other OpenAI-compatible endpoints work too. Plain HTTP is accepted only on loopback; remote endpoints must use HTTPS.
+
+While a rewrite is in flight, the overlay says **Refining transcript…** and ignores repeat hotkeys. If the request times out, is rejected, returns malformed/empty output, or expands suspiciously, Ogma uses the original transcript. With review enabled the card says so explicitly; with immediate insertion the same target-safe fallback is used. Rewritten words do not display STT confidence colors because their positions no longer correspond to the recognizer's tokens.
+
 **Personal dictionary:** click **Dictionary…** in the menu to add names and jargon (one word per line, `#` for comments — it's a plain file at `~/.config/ogma/dictionary.txt` if you prefer an editor; changes apply immediately either way). When dictation mishears one of your words, the chip offers it as the ↻ replacement — matching is *phonetic*, so `Xanthippe` is found even when the model heard "Zantipi". Your dictionary words are also protected: autocorrect will never suggest changing them.
 
 **STT Engine:** two on-device models are available under **STT Engine** at the top of the Dictation section. **Parakeet** (default, ~2.4 GB) is fast and light, with sub-second live updates. **Voxtral** (Voxtral Realtime 4B, an extra ~3.2 GB Apache-licensed download on first selection) runs a language-model decoder for noticeably better grammar, punctuation, and sentence structure. Voxtral incrementally caches each audio chunk instead of re-decoding the recording: Detailed mode shows its live text, while None and Simple advance the same high-quality transcription silently for near-instant finalization. Only one model is in memory at a time; if Voxtral ever fails to load, dictation automatically falls back to Parakeet. Confidence highlighting and ↻ suggestions apply to Parakeet transcripts only — Voxtral doesn't report per-word confidence.
@@ -117,6 +122,7 @@ Filler words (*um, uh, er, hmm…*) are removed automatically — they never eve
 | **STT Engine** | Parakeet (fast, default) or Voxtral (best accuracy — better grammar and punctuation, ~3.5 GB in memory while loaded). |
 | **Recording Indicator** | **None:** animated menu-bar waveform only. **Simple:** animated menu-bar waveform plus a compact speech-responsive audio meter and Stop Recording button. **Detailed** (default): the existing live transcript card. |
 | **Review before insert** | On (default) — show the review card when dictation stops. Off — insert immediately, as if the card didn't exist. |
+| **Intent Rewrite** | Off (default), OpenAI, Anthropic, or an OpenAI-compatible local/remote endpoint. Configure model, endpoint, key, and timeout from the submenu. |
 | **Insert Method** | **Paste all at once** (default), or type the transcript as ordinary key events at 60, 120, 240, or a custom WPM. Paced typing helps web editors that mishandle a large paste event. |
 | **Auto-unload after** | How long the speech model stays in memory after the last dictation (default 2 minutes). |
 
@@ -127,10 +133,6 @@ Filler words (*um, uh, er, hmm…*) are removed automatically — they never eve
 | **Sentence Pause** | Milliseconds of silence between sentences (default 400ms). Scales inversely with speed -- at 2× speed, a 400ms pause becomes 200ms. Click the menu item and type any value; set to 0 for no pause. |
 
 Settings take effect immediately — no restart needed.
-
-### Future features — not included in this build
-
-Additional opt-in API engines for audio generation or transcription may be offered in a future release. They are not implemented in this build. Current dictation remains on-device.
 
 ### ElevenLabs voices
 
@@ -165,7 +167,7 @@ You can also enter any voice ID from the [ElevenLabs Voice Library](https://elev
 
 ## Uninstall
 
-Double-click **`uninstall.command`** — it removes everything including the Accessibility permission, login item, API key, and app bundle.
+Double-click **`uninstall.command`** — it removes everything including the Accessibility permission, login item, API keys, and app bundle.
 
 ## Troubleshooting
 
@@ -176,6 +178,7 @@ Double-click **`uninstall.command`** — it removes everything including the Acc
 | Waveform icon not in menu bar | Open `/Applications/Ogma.app` (pkg installs) or `~/Applications/Ogma.app` (source installs) manually |
 | HTTP 401 | API key is wrong or expired — update it via the menu bar icon → **API Key…** |
 | HTTP 429 | Monthly character quota exceeded — if both backends are installed, the app automatically falls back to local TTS. On Apple Silicon with ElevenLabs only, it will offer to install local TTS as a free alternative |
+| Intent Rewrite uses the original transcript | Open **Intent Rewrite → Configure…** and check the model, API key, endpoint, and timeout. Remote compatible endpoints require HTTPS; local HTTP endpoints must use `localhost`, `127.x.x.x`, or `::1`. Provider failures are logged to Console under Ogma without transcript contents. |
 | "python3 not found" | Run `xcode-select --install` in Terminal |
 | Settings app fails to compile *(source installs only)* | Check `~/.local/share/ogma/install.log` for the error. Usually fixed by updating Command Line Tools: `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
 | Local TTS is slow | Check `~/.local/share/ogma/tts.log` for errors. The TTS daemon keeps the model loaded and warmed up in memory so requests are near-instant |
@@ -186,6 +189,8 @@ Double-click **`uninstall.command`** — it removes everything including the Acc
 **ElevenLabs:** the free tier includes a monthly character allowance — usually sufficient for casual read-aloud use. Paid plans start at $5/month. See [elevenlabs.io/pricing](https://elevenlabs.io/pricing).
 
 **Local (Kokoro):** completely free. Runs on your Mac with no API calls or credits. Requires Apple Silicon and a one-time ~350 MB model download.
+
+**Intent Rewrite:** local OpenAI-compatible servers are free aside from your hardware. OpenAI and Anthropic usage is billed by those providers according to the model you configure; Ogma sends one text-only request per completed dictation when enabled.
 
 ## License
 
@@ -219,6 +224,12 @@ STT_ENGINES_INSTALLED="parakeet"
 DICTATION_REVIEW="true"
 DICTATION_INSERT_MODE="paste"
 DICTATION_TYPING_WPM="120"
+INTENT_REWRITE_PROVIDER="off"
+INTENT_OPENAI_MODEL="gpt-5.6-luna"
+INTENT_ANTHROPIC_MODEL="claude-haiku-4-5-20251001"
+INTENT_COMPATIBLE_URL="http://127.0.0.1:11434/v1"
+INTENT_COMPATIBLE_MODEL="llama3.2:3b"
+INTENT_REWRITE_TIMEOUT="15"
 RECORDING_INDICATOR="detailed"
 SENTENCE_PAUSE="400"
 ```

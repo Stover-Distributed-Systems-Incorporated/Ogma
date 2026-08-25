@@ -22,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-result=$(osascript -e 'button returned of (display dialog "This will completely remove Ogma:\n\n  • Stop and remove the menu bar app\n  • Remove Accessibility permission\n  • Remove the speak script\n  • Remove the Services workflow\n  • Remove settings and config\n  • Remove the local TTS environment\n  • Remove the API key from Keychain\n  • Remove the login item (if set)" with title "Ogma" buttons {"Cancel", "Uninstall"} default button "Cancel" with icon caution)' 2>/dev/null || true)
+result=$(osascript -e 'button returned of (display dialog "This will completely remove Ogma:\n\n  • Stop and remove the menu bar app\n  • Remove Accessibility permission\n  • Remove the speak script\n  • Remove the Services workflow\n  • Remove settings and config\n  • Remove the local TTS environment\n  • Remove API keys from Keychain\n  • Remove the login item (if set)" with title "Ogma" buttons {"Cancel", "Uninstall"} default button "Cancel" with icon caution)' 2>/dev/null || true)
 [ "$result" = "Uninstall" ] || exit 0
 
 printf '\033[2J\033[H'
@@ -92,7 +92,15 @@ step "Local TTS data removed"
 security delete-generic-password \
     -a "ogma" \
     -s "ogma-api-key" 2>/dev/null || true
-step "API key removed from Keychain"
+for _intent_service in \
+    ogma-intent-openai-api-key \
+    ogma-intent-anthropic-api-key \
+    ogma-intent-compatible-api-key; do
+    security delete-generic-password \
+        -a "ogma" \
+        -s "$_intent_service" 2>/dev/null || true
+done
+step "API keys removed from Keychain"
 
 
 # ── Remove login item ────────────────────────────────────────────

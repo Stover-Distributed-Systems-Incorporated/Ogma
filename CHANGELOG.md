@@ -4,6 +4,8 @@
 
 ### Features
 
+- **Optional intent-aware dictation rewriting.** Ogma can now pass the final local STT transcript through OpenAI, Anthropic, or a local/remote OpenAI-compatible server before review or insertion. Provider, model, compatible endpoint, API key, and timeout are configurable from the Dictation menu; credentials live in separate Keychain entries. The rewrite prompt resolves spoken corrections, false starts, repetition, spelling, and punctuation while preserving the user's intended meaning.
+- **Private and failure-safe by design.** Intent Rewrite is off by default and enabling a provider explicitly discloses that final transcript text—never audio—is sent to it. Loopback servers may use HTTP, remote compatible endpoints require HTTPS, and API requests refuse redirects. A visible refining state covers provider latency; timeout, HTTP, parsing, empty-output, and suspicious-expansion failures all fall back to the untouched transcript. OpenAI requests set `store: false`.
 - **Dictation can now type instead of paste.** The new **Insert Method** menu offers the existing all-at-once paste plus paced Unicode typing at 60, 120, 240, or a custom WPM. Typed insertion avoids duplicate output in web editors that mishandle large paste events, does not disturb the clipboard on success, and falls back to copying the full transcript if focus becomes unsafe.
 
 ### Bug fixes
