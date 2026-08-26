@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.4.1
+
+### Features
+
+- **Universal cancel shortcut.** Press `⌥⇧Space` to stop text-to-speech, stop speed reading, or discard an active dictation without finalizing its STT stream. Cancelling a recording or pending final prevents its transcript from being sent to Intent Rewrite; cancelling during an in-flight rewrite aborts the request and discards the result.
+
 ## v2.4.0
 
 ### Features

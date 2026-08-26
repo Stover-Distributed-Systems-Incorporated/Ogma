@@ -8,6 +8,7 @@
   Select text in any app, press <kbd>⌥</kbd><kbd>⇧</kbd><kbd>/</kbd>, hear it read aloud.<br>
   Press <kbd>⌥</kbd><kbd>⇧</kbd><kbd>D</kbd> and talk — your words appear at the cursor (local, Apple Silicon).<br>
   Cloud TTS via <a href="https://elevenlabs.io">ElevenLabs</a>, or local TTS via <a href="https://github.com/Blaizzy/mlx-audio">Kokoro</a> (Apple Silicon).<br>
+  Press <kbd>⌥</kbd><kbd>⇧</kbd><kbd>Space</kbd> to cancel any active operation.<br>
   Runs in your menu bar.
 </p>
 
@@ -25,7 +26,7 @@ Mac voice tools have a racket going: **$49** for a text-to-speech utility here, 
 - **Free. Actually free.** No license key, no trial, no upsell. It's public domain ([Unlicense](https://unlicense.org)) — you can't even pay for it.
 - **Open source.** Read every line before you trust it with your voice.
 - **Private.** The models run locally on your own silicon. Your audio and your words never have to leave the machine.
-- **Easy.** Two hotkeys. `⌥⇧/` reads anything to you. `⌥⇧D` types anything you say.
+- **Easy.** `⌥⇧/` reads anything to you. `⌥⇧D` types anything you say. `⌥⇧Space` cancels either one.
 
 If you were about to spend $49 on this: don't.
 
@@ -66,6 +67,7 @@ Once installed, the **waveform icon** appears in your menu bar. On first launch 
 - **Select any text** in any app → press `⌥⇧/` → audio plays
 - **Press `⌥⇧/` again** while audio is playing → stops immediately
 - **Press `⌥⇧D`** and talk → a live caption shows what's being heard → press `⌥⇧D` again → review the transcript, then press **Return** to insert it at your cursor (local dictation, Apple Silicon)
+- **Press `⌥⇧Space`** at any time → cancel the active operation. During dictation this discards the recording without finalizing it or sending its transcript to Intent Rewrite.
 
 The waveform icon pulses while audio is being generated and played, so you always know it's working.
 
@@ -100,6 +102,8 @@ Click the **waveform icon** in the menu bar. The menu adapts to your setup — y
 
 Press `⌥⇧D` to start dictating anywhere. The default **Detailed** recording indicator shows the live transcript as you speak. Press `⌥⇧D` again to stop; when **Review before insert** is enabled, the final transcript appears in an interactive review card:
 
+To abandon a dictation instead of finalizing it, press `⌥⇧Space`. Ogma closes the speech-recognition stream and discards the partial transcript, so Intent Rewrite never receives it. The same shortcut also stops read-aloud and speed-reading playback.
+
 - **✓ Insert** (`Return`) — insert the transcript at your cursor using the selected **Insert Method**. Click into another app first to redirect it there.
 - **Edit** — just click the text and type; your edits show in gray so you can tell them apart from the transcription. `Shift+Return` adds a newline.
 - **✗ Discard** (`Esc`) — throw it away.
@@ -111,7 +115,7 @@ Filler words (*um, uh, er, hmm…*) are removed automatically — they never eve
 
 **Intent Rewrite (optional):** after local speech recognition finishes, Ogma can ask an LLM to produce the text you meant to write. It resolves spoken revisions and false starts—for example, *“Today I got ice cream—no, wait—licorice”* becomes *“Today I got licorice.”*—while preserving meaning instead of answering or acting on the dictated text. Choose **OpenAI**, **Anthropic**, or **OpenAI-compatible (local or remote)**. Provider, model, endpoint, timeout, and credentials are configurable; keys stay in Keychain. OpenAI requests use the Responses API with storage disabled. Local servers default to Ollama's `http://127.0.0.1:11434/v1` compatibility endpoint, but LM Studio and other OpenAI-compatible endpoints work too. Plain HTTP is accepted only on loopback; remote endpoints must use HTTPS.
 
-While a rewrite is in flight, the overlay says **Refining transcript…** and ignores repeat hotkeys. If the request times out, is rejected, returns malformed/empty output, or expands suspiciously, Ogma uses the original transcript. With review enabled the card says so explicitly; with immediate insertion the same target-safe fallback is used. Rewritten words do not display STT confidence colors because their positions no longer correspond to the recognizer's tokens.
+While a rewrite is in flight, the overlay says **Refining transcript…** and ignores repeat dictation hotkeys; `⌥⇧Space` still cancels the request and discards its result. If the request times out, is rejected, returns malformed/empty output, or expands suspiciously, Ogma uses the original transcript. With review enabled the card says so explicitly; with immediate insertion the same target-safe fallback is used. Rewritten words do not display STT confidence colors because their positions no longer correspond to the recognizer's tokens.
 
 **Personal dictionary:** click **Dictionary…** in the menu to add names and jargon (one word per line, `#` for comments — it's a plain file at `~/.config/ogma/dictionary.txt` if you prefer an editor; changes apply immediately either way). When dictation mishears one of your words, the chip offers it as the ↻ replacement — matching is *phonetic*, so `Xanthippe` is found even when the model heard "Zantipi". Your dictionary words are also protected: autocorrect will never suggest changing them.
 

@@ -690,6 +690,8 @@ private let kHotkeyCode: Int64 = 44
 private let kDictateHotkeyCode: Int64 = 2
 // Keycode 15 = "R" → ⌥⇧R speed-reads (RSVP) the selection in a floating overlay.
 private let kSpeedReadHotkeyCode: Int64 = 15
+// Keycode 49 = Space → ⌥⇧Space cancels any active Ogma operation.
+private let kCancelHotkeyCode: Int64 = 49
 
 // Module-level tap reference so the C callback can re-enable it after a timeout.
 private var globalTap: CFMachPort?
@@ -715,7 +717,8 @@ private let hotkeyCallback: CGEventTapCallBack = { _, type, event, _ in
     let flags = event.flags.intersection([.maskAlternate, .maskShift, .maskControl, .maskCommand])
 
     guard flags == [.maskAlternate, .maskShift],
-          code == kHotkeyCode || code == kDictateHotkeyCode || code == kSpeedReadHotkeyCode else {
+          code == kHotkeyCode || code == kDictateHotkeyCode
+            || code == kSpeedReadHotkeyCode || code == kCancelHotkeyCode else {
         lastUserKeyDownAt = CFAbsoluteTimeGetCurrent()
         return Unmanaged.passRetained(event)
     }
@@ -725,7 +728,9 @@ private let hotkeyCallback: CGEventTapCallBack = { _, type, event, _ in
 
     // Fire on a background thread — never block the event tap.
     DispatchQueue.global(qos: .userInitiated).async {
-        if code == kDictateHotkeyCode {
+        if code == kCancelHotkeyCode {
+            appDelegateRef?.handleCancelHotkey()
+        } else if code == kDictateHotkeyCode {
             appDelegateRef?.handleDictateHotkey()
         } else if code == kSpeedReadHotkeyCode {
             appDelegateRef?.handleSpeedReadHotkey()
@@ -2068,6 +2073,21 @@ private final class SpeedReadController: NSObject, NSWindowDelegate {
         clipPlayer?.terminate(); clipPlayer = nil
     }
 
+    // Universal cancel stops playback and any potentially expensive audio
+    // preparation without closing the editable Speed Reader window.
+    func cancelPlayback() {
+        preparationGeneration += 1
+        if preparing {
+            preparing = false
+            cancelClips?()
+            playPause.isEnabled = true
+            restart.isEnabled = true
+            audioCheck.isEnabled = audioAvailable
+        }
+        pause()
+        updateProgress()
+    }
+
     private func scheduleTick() {
         timer?.invalidate()
         let interval = 60.0 / Double(max(1, wpm))   // seconds per word
@@ -2826,6 +2846,21 @@ private final class RecordingIndicatorOverlay: NSObject {
         }
     }
 
+    // ⌥⇧Space is deliberately separate from every start/finish shortcut. It
+    // always means "stop and discard": TTS stops, RSVP stops, and an active
+    // dictation stream is closed without sending its end-of-stream marker, so
+    // no final transcript can advance into Intent Rewrite.
+    func handleCancelHotkey() {
+        // Process state is lock-protected and safe to stop from this hotkey's
+        // background queue. UI and dictation state remain main-thread-only.
+        stopSpeaking()
+        DispatchQueue.main.async {
+            self.cancelActiveDictation()
+            self.rsvpOverlay?.stop()
+            self.speedReader?.cancelPlayback()
+        }
+    }
+
     private func installHotkey() {
         guard AXIsProcessTrusted() else { return }
         guard globalTap == nil else { return }  // already installed
@@ -2961,15 +2996,29 @@ private final class RecordingIndicatorOverlay: NSObject {
                 task.standardInput = FileHandle.nullDevice
             }
 
+            // Keep generation validation, process publication, and launch in
+            // one critical section. Otherwise cancel can land after the task
+            // is published but before it is running (nothing to terminate),
+            // and the supposedly cancelled speech starts a moment later.
+            var staleBeforeLaunch = false
+            var launchFailed = false
             speakLock.lock()
-            currentSpeakProcess = task
+            if speakGeneration != gen {
+                staleBeforeLaunch = true
+            } else {
+                currentSpeakProcess = task
+                do {
+                    try task.run()
+                } catch {
+                    currentSpeakProcess = nil
+                    if speakGeneration == gen { isSpeakingFlag = false }
+                    launchFailed = true
+                }
+            }
             speakLock.unlock()
 
-            do { try task.run() } catch {
-                speakLock.lock()
-                currentSpeakProcess = nil
-                if speakGeneration == gen { isSpeakingFlag = false }
-                speakLock.unlock()
+            if staleBeforeLaunch { return }
+            if launchFailed {
                 DispatchQueue.main.async {
                     self.speakLock.lock()
                     let current = self.speakGeneration
@@ -3549,6 +3598,50 @@ private final class RecordingIndicatorOverlay: NSObject {
         }
     }
 
+    private func cancelActiveDictation() {
+        let state = currentDictationState()
+        switch state {
+        case .idle:
+            return
+        case .reviewing:
+            completeReview(insert: nil)
+            return
+        case .cardRecording:
+            stopEngine()
+            cleanupDictation()
+            dictationGeneration &+= 1
+            overlay.cancelCardDictation()
+            setDictationState(.reviewing)
+            return
+        case .cardAwaitingFinal:
+            cleanupDictation()
+            dictationGeneration &+= 1
+            overlay.cancelCardDictation()
+            setDictationState(.reviewing)
+            return
+        case .recording:
+            stopEngine()
+        case .starting, .awaitingFinal, .rewriting:
+            break
+        }
+
+        // Closing the STT client (rather than finish()) is the important
+        // privacy/cost invariant: the daemon gets no end-of-stream request,
+        // its late callbacks lose their identity guard, and Intent Rewrite is
+        // never started for a recording cancelled before finalization.
+        cleanupDictation()
+        dictationGeneration &+= 1
+        intentRewriteGeneration &+= 1
+        intentRewriteTask?.cancel()
+        intentRewriteTask = nil
+        stopRecordingOverlayHealthTimer()
+        recordingOverlay.hide()
+        overlay.hide()
+        setDictating(false)
+        dictationTargetApp = nil
+        setDictationState(.idle)
+    }
+
     // Called (on main, identity-guarded) when the daemon sends the final.
     private func finishDictation(final: String, words: [STTWord]) {
         // The daemon can end the stream on its own (60s of silence — e.g. a
@@ -3939,7 +4032,11 @@ private final class RecordingIndicatorOverlay: NSObject {
         speakLock.lock()
         isSpeakingFlag = false
         speakLock.unlock()
-        DispatchQueue.main.async { self.setSpeaking(false) }
+        DispatchQueue.main.async {
+            self.respeakTimer?.invalidate()
+            self.respeakTimer = nil
+            self.setSpeaking(false)
+        }
     }
 
     func calculateRemainingText() -> String? {
@@ -4037,7 +4134,11 @@ private final class RecordingIndicatorOverlay: NSObject {
             respeakTimer?.invalidate()
             respeakTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
                 DispatchQueue.global(qos: .userInitiated).async {
-                    self?.respeak()
+                    guard let self = self else { return }
+                    self.speakLock.lock()
+                    let stillSpeaking = self.isSpeakingFlag
+                    self.speakLock.unlock()
+                    if stillSpeaking { self.respeak() }
                 }
             }
         }

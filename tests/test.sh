@@ -555,6 +555,38 @@ check "Swift: menu order is TTS Engine, Sentence Pause, STT controls, Speed Read
 check "Swift: dictation correction sharing and its network endpoint are removed" \
     "yes" "$(! grep -q 'var shareCorrections\\|recordCorrectionIfEnabled\\|uploadPendingCorrections\\|buildImproveDictationItems\\|OGMA_CORRECTIONS_URL\\|api/ogma/corrections' "$SETTINGS_SWIFT" && echo yes || echo no)"
 
+check "Swift: Option-Shift-Space is registered as the universal cancel hotkey" \
+    "yes" "$(grep -q 'kCancelHotkeyCode: Int64 = 49' "$SETTINGS_SWIFT" && \
+             grep -q 'handleCancelHotkey' "$SETTINGS_SWIFT" && echo yes || echo no)"
+
+check "Swift: universal cancel stops TTS and speed reading" \
+    "yes" "$(sed -n '/func handleCancelHotkey/,/private func installHotkey/p' "$SETTINGS_SWIFT" | \
+             grep -q 'stopSpeaking' && \
+             sed -n '/func handleCancelHotkey/,/private func installHotkey/p' "$SETTINGS_SWIFT" | \
+             grep -q 'rsvpOverlay.*stop' && \
+             sed -n '/func handleCancelHotkey/,/private func installHotkey/p' "$SETTINGS_SWIFT" | \
+             grep -q 'cancelPlayback' && echo yes || echo no)"
+
+check "Swift: TTS launch is generation-guarded against cancel races" \
+    "yes" "$(sed -n '/func runSpeak/,/task.waitUntilExit/p' "$SETTINGS_SWIFT" | \
+             grep -q 'speakGeneration != gen' && \
+             sed -n '/func runSpeak/,/task.waitUntilExit/p' "$SETTINGS_SWIFT" | \
+             grep -q 'try task.run' && echo yes || echo no)"
+
+check "Swift: TTS cancel invalidates pending respeak" \
+    "yes" "$(sed -n '/func stopSpeaking/,/func calculateRemainingText/p' "$SETTINGS_SWIFT" | \
+             grep -q 'respeakTimer.*invalidate' && \
+             sed -n '/func scheduleRespeak/,/\/\/ MARK: - Keychain helpers/p' "$SETTINGS_SWIFT" | \
+             grep -q 'stillSpeaking' && echo yes || echo no)"
+
+check "Swift: dictation cancel closes the stream without finalizing or rewriting" \
+    "yes" "$(sed -n '/func cancelActiveDictation/,/\/\/ Called (on main/p' "$SETTINGS_SWIFT" | \
+             grep -q 'cleanupDictation' && \
+             ! sed -n '/func cancelActiveDictation/,/\/\/ Called (on main/p' "$SETTINGS_SWIFT" | \
+             grep -q 'sttClient.*finish' && \
+             sed -n '/func cancelActiveDictation/,/\/\/ Called (on main/p' "$SETTINGS_SWIFT" | \
+             grep -q 'intentRewriteTask.*cancel' && echo yes || echo no)"
+
 # ── 11. Swift compile (slow ~15s) ────────────────────────────────
 
 section "Ogma.swift compile"
