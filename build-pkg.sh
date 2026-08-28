@@ -149,7 +149,10 @@ for (n,name) in [(16,"icon_16x16"),(32,"icon_16x16@2x"),(32,"icon_32x32"),
 }
 SWIFT_END
 xcrun swift "$_ICONSCRIPT" "$_ICONSET"
-iconutil -c icns "$_ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+if ! iconutil -c icns "$_ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"; then
+    echo "iconutil rejected the generated iconset; using the bundled fallback icon."
+    cp "$SCRIPT_DIR/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+fi
 
 # ── 5. Ad-hoc code sign ──────────────────────────────────────────
 # Strip extended attributes first so the payload carries no AppleDouble

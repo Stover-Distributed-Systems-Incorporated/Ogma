@@ -293,6 +293,14 @@ private enum IntentRewriteClient {
         }
     }
 
+    // Rewrites normally produce fewer visible tokens than the source, but
+    // reasoning models also charge their internal reasoning against the
+    // completion limit. Give them enough room to finish without relaxing the
+    // separate post-response expansion guard below.
+    static func completionTokenLimit(for transcript: String) -> Int {
+        min(max(2048, transcript.utf8.count + 512), 8192)
+    }
+
     static func endpoint(for settings: IntentRewriteSettings) throws -> URL {
         switch settings.provider {
         case .openai:
@@ -347,7 +355,7 @@ private enum IntentRewriteClient {
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let maxTokens = min(max(512, transcript.utf8.count / 2 + 128), 4096)
+        let maxTokens = completionTokenLimit(for: transcript)
         let userInput = "Raw transcript (\(transcript.utf8.count) UTF-8 bytes):\n\n" + transcript
         let body: [String: Any]
         switch settings.provider {
@@ -521,6 +529,11 @@ private func runIntentRewriteSelfTest() -> Bool {
           requestJSON["store"] as? Bool == false,
           requestJSON["input"] as? String != nil,
           requestData.range(of: Data("secret".utf8)) == nil else { return false }
+    guard let openAITokenLimit = requestJSON["max_output_tokens"] as? Int,
+          openAITokenLimit == IntentRewriteClient.completionTokenLimit(for: original) else {
+        fputs("Intent Rewrite self-test: OpenAI completion token limit mismatch.\n", stderr)
+        return false
+    }
 
     let anthropic = IntentRewriteSettings(provider: .anthropic, model: "test-model",
                                           compatibleBaseURL: nil, apiKey: "anthropic-secret",
@@ -554,7 +567,23 @@ private func runIntentRewriteSelfTest() -> Bool {
     guard let localRequest = try? IntentRewriteClient.makeRequest(transcript: original,
                                                                   settings: local),
           localRequest.url?.absoluteString == "http://localhost:11434/v1/chat/completions",
-          localRequest.value(forHTTPHeaderField: "Authorization") == nil else { return false }
+          localRequest.value(forHTTPHeaderField: "Authorization") == nil,
+          let localRequestData = localRequest.httpBody,
+          let localRequestJSON = try? JSONSerialization.jsonObject(
+            with: localRequestData) as? [String: Any],
+          let compatibleTokenLimit = localRequestJSON["max_tokens"] as? Int,
+          compatibleTokenLimit
+            == IntentRewriteClient.completionTokenLimit(for: original) else {
+        fputs("Intent Rewrite self-test: compatible completion token limit mismatch.\n", stderr)
+        return false
+    }
+    let longTranscript = String(repeating: "a", count: 1519)
+    guard IntentRewriteClient.completionTokenLimit(for: longTranscript) == 2048,
+          IntentRewriteClient.completionTokenLimit(
+            for: String(repeating: "a", count: 20_000)) == 8192 else {
+        fputs("Intent Rewrite self-test: completion token limit scaling mismatch.\n", stderr)
+        return false
+    }
     let fenced = #"{"choices":[{"message":{"content":"```text\nToday I got licorice.\n```"}}]}"#.data(using: .utf8)!
     guard (try? IntentRewriteClient.rewrittenText(from: fenced, provider: .compatible,
                                                    original: original)) == "Today I got licorice." else {

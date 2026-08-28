@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.4.2
+
+### Bug fixes
+
+- **Intent Rewrite no longer cuts off longer dictations when a reasoning model uses part of the completion budget internally.** Rewrite requests now reserve substantially more bounded completion headroom while retaining the existing suspicious-expansion check and original-transcript fallback.
+
 ## v2.4.1
 
 ### Features

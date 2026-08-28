@@ -634,9 +634,14 @@ if [ "$settings_result" = "Install" ]; then
 </plist>
 END_PLIST
 
-        # Generate app icon
-        spin "Generating app icon…"
+        # Install the prebuilt icon when available. Current macOS releases can
+        # reject otherwise-valid iconsets, so generation remains a fallback
+        # for older source archives only.
+        spin "Installing app icon…"
         mkdir -p "$APP_BUNDLE/Contents/Resources"
+        if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
+            cp "$SCRIPT_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+        else
         _ICONTMP=$(mktemp -d)
         _ICONSET="$_ICONTMP/AppIcon.iconset"
         mkdir -p "$_ICONSET"
@@ -693,8 +698,9 @@ SWIFT_END
         fi
         rm -f "$_ICONSCRIPT"
         rm -rf "$_ICONTMP"
+        fi
         unspin
-        step "App icon generated"
+        step "App icon installed"
 
         # Code sign
         codesign --force --sign - "$APP_BUNDLE" 2>/dev/null || true

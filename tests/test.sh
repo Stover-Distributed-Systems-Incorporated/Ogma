@@ -2414,6 +2414,12 @@ check "Ogma.swift: intent rewrite uses provider-native APIs and safe fallback" \
              grep -q 'case .failure' "$SETTINGS_SWIFT" && \
              grep -q 'using original' "$SETTINGS_SWIFT" && echo yes || echo no)"
 
+check "Ogma.swift: intent rewrite reserves completion room for reasoning models" \
+    "yes" "$(grep -q 'func completionTokenLimit' "$SETTINGS_SWIFT" && \
+             grep -q 'max(2048, transcript.utf8.count + 512)' "$SETTINGS_SWIFT" && \
+             grep -q 'completionTokenLimit(for: transcript)' "$SETTINGS_SWIFT" && \
+             echo yes || echo no)"
+
 check "Ogma.swift: intent rewrite keys stay in Keychain" \
     "yes" "$(grep -q 'ogma-intent-openai-api-key' "$SETTINGS_SWIFT" && \
              grep -q 'ogma-intent-anthropic-api-key' "$SETTINGS_SWIFT" && \
