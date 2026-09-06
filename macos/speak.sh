@@ -12,10 +12,13 @@
 
 # ── Configuration ──────────────────────────────────────────────────
 
+# Text snapshots, generated audio and IPC files belong only to this user.
+umask 077
+
 # Read settings written by the menu bar without executing the file. The config
 # is user-editable, so `source` would turn a voice ID or a comment into shell
 # code. This deliberately supports only plain KEY=value entries.
-_CONFIG="$HOME/.config/ogma/config"
+_CONFIG="${OGMA_CONFIG_FILE:-$HOME/.config/ogma/config}"
 _config_value() {
     local wanted="$1" line key value
     [ -r "$_CONFIG" ] || return 0
@@ -72,7 +75,20 @@ SENTENCE_PAUSE="${SENTENCE_PAUSE:-400}"
 
 # ── Validate numeric config values ───────────────────────────────
 # Prevents malformed JSON if config is manually edited with bad values.
-_validate_num() { [[ "$2" =~ ^[0-9]*\.?[0-9]+$ ]] && echo "$2" || echo "$3"; }
+_validate_num() {
+    local minimum=0 maximum=1
+    case "$1" in
+        SPEED) minimum=0.7; maximum=1.2 ;;
+        LOCAL_SPEED) minimum=0.5; maximum=2 ;;
+        SENTENCE_PAUSE) maximum=10000 ;;
+    esac
+    if [[ "$2" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] && [ "${#2}" -le 16 ] &&
+       awk -v value="$2" -v lo="$minimum" -v hi="$maximum" 'BEGIN {exit !(value >= lo && value <= hi)}'; then
+        printf '%s\n' "$2"
+    else
+        printf '%s\n' "$3"
+    fi
+}
 SPEED=$(_validate_num SPEED "$SPEED" "1.0")
 LOCAL_SPEED=$(_validate_num LOCAL_SPEED "$LOCAL_SPEED" "1.0")
 SENTENCE_PAUSE=$(_validate_num SENTENCE_PAUSE "$SENTENCE_PAUSE" "400")
@@ -100,7 +116,9 @@ TEXT_FILE="${TMPDIR:-/tmp}/ogma_text"
 STATUS_FILE="${TMPDIR:-/tmp}/ogma_status"
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
-    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    if [[ "$OLD_PID" =~ ^[1-9][0-9]+$ ]] && [ "$OLD_PID" -gt 1 ] &&
+       kill -0 "$OLD_PID" 2>/dev/null &&
+       ps -p "$OLD_PID" -o args= 2>/dev/null | grep -q '[s]peak\.sh'; then
         # Kill children first (curl, python, afplay) so bash can handle SIGTERM
         pkill -P "$OLD_PID" 2>/dev/null
         kill "$OLD_PID" 2>/dev/null
@@ -218,7 +236,8 @@ cleanup() {
     [ -n "$_AUDIO_PLAYER_PID" ] && kill "$_AUDIO_PLAYER_PID" 2>/dev/null
     exec 7>&- 2>/dev/null; exec 8<&- 2>/dev/null
     pkill -P $$ 2>/dev/null
-    rm -f "$TMP_FILE" "$_PREV_TMP_FILE" "${TMP_FILE}.code"
+    rm -f "$TMP_FILE" "$_PREV_TMP_FILE"
+    [ -n "$TMP_FILE" ] && rm -f "${TMP_FILE}.code"
     [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
     [ -n "$_PREV_TMP_DIR" ] && rm -rf "$_PREV_TMP_DIR"
     # Only remove PID file if it's ours (another instance may have overwritten it)
@@ -275,9 +294,9 @@ for p in parts:
 # memory for near-instant response.  Falls back to direct invocation if
 # the daemon is unavailable.
 
-LOG_FILE="$HOME/.local/share/ogma/tts.log"
+LOG_FILE="${OGMA_DATA_DIR:-$HOME/.local/share/ogma}/tts.log"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-TTS_SOCK="${TTS_SOCK:-$HOME/.local/share/ogma/tts.sock}"
+TTS_SOCK="${TTS_SOCK:-${OGMA_DATA_DIR:-$HOME/.local/share/ogma}/tts.sock}"
 
 # Start the TTS daemon if not already running.
 # The daemon uses flock internally — if another daemon is already running,
@@ -318,7 +337,7 @@ start_tts_daemon() {
 tts_daemon_request() {
     local text_json voice="${_VOICE:-bf_lily}" speed="${_SPEED:-1.00}" lang="${_LANG:-b}"
     text_json=$(json_encode "$TEXT")
-    local req="{\"text\":${text_json},\"voice\":\"${voice}\",\"speed\":\"${speed}\",\"lang_code\":\"${lang}\"}"
+    local req="{\"text\":${text_json},\"voice\":$(json_encode "$voice"),\"speed\":$(json_encode "$speed"),\"lang_code\":$(json_encode "$lang")}"
     # nc -U on macOS silently drops responses from Unix sockets.
     # Use a python one-liner for reliable socket I/O (one fork, same as nc).
     local resp
@@ -466,6 +485,8 @@ json_encode() {
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
     printf '"%s"' "$s"
 }
 
@@ -505,7 +526,7 @@ run_elevenlabs_tts() {
         -H "Content-Type: application/json" \
         -d "{
             \"text\": ${JSON_TEXT},
-            \"model_id\": \"${MODEL_ID}\",
+            \"model_id\": $(json_encode "$MODEL_ID"),
             \"voice_settings\": {
                 \"stability\": ${STABILITY},
                 \"similarity_boost\": ${SIMILARITY_BOOST},

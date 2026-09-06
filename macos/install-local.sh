@@ -11,8 +11,19 @@
 # Updates ~/.config/ogma/config to reflect the new backend.
 
 set -eo pipefail
+umask 077
 
 VENV_DIR="${VENV_DIR:-$HOME/.local/share/ogma/venv}"
+
+# This installer replaces environments; reject broad or relative overrides.
+case "$VENV_DIR" in
+    /*/venv|/*/.venv) ;;
+    *) echo "VENV_DIR must be an absolute path ending in venv or .venv." >&2; exit 1 ;;
+esac
+if [ -L "$VENV_DIR" ]; then
+    echo "Refusing to replace a symlinked Python environment: $VENV_DIR" >&2
+    exit 1
+fi
 
 # ── Options ──────────────────────────────────────────────────────
 # --with-voxtral (or OGMA_INSTALL_VOXTRAL=1) additionally downloads the
@@ -142,7 +153,24 @@ if [ -d "$VENV_DIR" ] && "$VENV_DIR/bin/python3" -c "import mlx_audio" 2>/dev/nu
     fi
 else
     echo "Creating Python venv at $VENV_DIR…"
-    rm -rf "$VENV_DIR"
+    _VENV_BACKUP=""
+    if [ -e "$VENV_DIR" ]; then
+        if [ ! -f "$VENV_DIR/pyvenv.cfg" ]; then
+            echo "Refusing to replace a directory that is not a Python venv: $VENV_DIR" >&2
+            exit 1
+        fi
+        _VENV_BACKUP=$(mktemp -d "${VENV_DIR}.backup.XXXXXX")
+        mv "$VENV_DIR" "$_VENV_BACKUP/venv"
+    fi
+    _VENV_READY=0
+    restore_venv_on_failure() {
+        if [ "$_VENV_READY" != 1 ] && [ -n "$_VENV_BACKUP" ]; then
+            [ ! -e "$VENV_DIR" ] || mv "$VENV_DIR" "$_VENV_BACKUP/failed-install"
+            mv "$_VENV_BACKUP/venv" "$VENV_DIR"
+            echo "Previous Python environment restored; failed install retained at $_VENV_BACKUP." >&2
+        fi
+    }
+    trap restore_venv_on_failure EXIT
     "$PYTHON" -m venv "$VENV_DIR"
 
     echo "Installing mlx-audio and dependencies…"
@@ -154,8 +182,11 @@ else
     set -e
     if [ $pip_exit -ne 0 ]; then
         echo "Failed to install mlx-audio." >&2
-        rm -rf "$VENV_DIR"
         exit 1
+    fi
+    _VENV_READY=1
+    if [ -n "$_VENV_BACKUP" ]; then
+        echo "Previous Python environment retained at $_VENV_BACKUP/venv."
     fi
     echo "mlx-audio installed."
 fi
@@ -204,7 +235,13 @@ for _f in count_1w.txt count_2w.txt; do
     if [ ! -s "$_NGRAM_DIR/$_f" ]; then
         echo "Downloading word-frequency data ($_f)…"
         set +e
-        curl -fSL --progress-bar -o "$_NGRAM_DIR/$_f" "https://norvig.com/ngrams/$_f"
+        _download=$(mktemp "$_NGRAM_DIR/.download.XXXXXX")
+        if curl -fSL --connect-timeout 15 --max-time 300 --progress-bar \
+            -o "$_download" "https://norvig.com/ngrams/$_f"; then
+            mv "$_download" "$_NGRAM_DIR/$_f"
+        else
+            rm -f "$_download"
+        fi
         set -e
     fi
 done

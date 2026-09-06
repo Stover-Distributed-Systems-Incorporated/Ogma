@@ -84,6 +84,11 @@ class QueuePlayer: NSObject, AVAudioPlayerDelegate {
                 let url = URL(fileURLWithPath: path)
                 guard let p = try? AVAudioPlayer(contentsOf: url) else {
                     fputs("ERROR: cannot open \(path)\n", stderr)
+                    // Even a rejected file owes Bash both protocol lines.
+                    DispatchQueue.main.async {
+                        print("0.000\nDONE")
+                        fflush(stdout)
+                    }
                     continue
                 }
                 p.delegate = self
@@ -124,9 +129,12 @@ class QueuePlayer: NSObject, AVAudioPlayerDelegate {
         current = item.player  // retain while playing (delegate is weak)
 
         let startPlaying = {
-            let status = "\(item.epoch)\n\(String(format: "%.3f", item.player.duration))\n\(item.offset)\n\(item.sentLen)\n"
+            let epoch = String(format: "%.3f", Date().timeIntervalSince1970)
+            let status = "\(epoch)\n\(String(format: "%.3f", item.player.duration))\n\(item.offset)\n\(item.sentLen)\n"
             try? status.write(toFile: item.statusFile, atomically: true, encoding: .utf8)
-            item.player.play()
+            if !item.player.play() {
+                self.audioPlayerDidFinishPlaying(item.player, successfully: false)
+            }
         }
 
         let delay = Double(item.pauseMs) / 1000.0
@@ -138,9 +146,14 @@ class QueuePlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard current === player else { return }
         print("DONE")
         fflush(stdout)
         playNext()
+    }
+
+    func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        audioPlayerDidFinishPlaying(player, successfully: false)
     }
 }
 

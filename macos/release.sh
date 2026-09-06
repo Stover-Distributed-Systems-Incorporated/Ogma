@@ -2,14 +2,14 @@
 # ── Ogma release helper ──────────────────────────────────────────
 # Usage: bash release.sh <version>    (e.g. bash release.sh 2.0.0)
 #
-# Creates (or updates) a GitHub release from CHANGELOG.md.
+# Creates a new draft GitHub release from CHANGELOG.md.
 # The CHANGELOG is the single source of truth for release notes.
 #
 # Steps:
 #   1. Extracts the section for the given version from CHANGELOG.md
 #   2. Appends a standard GitHub footer
 #   3. Builds the installer pkg (build-pkg.sh) and a source zip
-#   4. Creates a draft release (or updates if it already exists)
+#   4. Creates a draft release at the exact committed build revision
 #
 # Publish manually: gh release edit v<version> --draft=false
 
@@ -25,6 +25,20 @@ fi
 TAG="v$VERSION"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHANGELOG="$SCRIPT_DIR/CHANGELOG.md"
+
+if ! git -C "$SCRIPT_DIR" diff --quiet HEAD -- . ../LICENSE; then
+    echo "Commit macOS and license changes before building a release." >&2
+    exit 1
+fi
+if [ -n "$(git -C "$SCRIPT_DIR" ls-files --others --exclude-standard -- .)" ]; then
+    echo "Commit or ignore untracked macOS files before building a release." >&2
+    exit 1
+fi
+if gh release view "$TAG" >/dev/null 2>&1; then
+    echo "Release $TAG already exists; choose a new version." >&2
+    exit 1
+fi
+REVISION=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
 
 if [ ! -f "$CHANGELOG" ]; then
     echo "Error: CHANGELOG.md not found at $CHANGELOG" >&2
@@ -58,16 +72,22 @@ open needs a one-time approval: System Settings → Privacy & Security → **Ope
 
 Prefer building from source? Download \`ogma.zip\`, unzip, and double-click \`install.command\`.
 
-See the [README](https://github.com/Stover-Distributed-Systems-Incorporated/Ogma#readme) for full documentation."
+See the [macOS README](https://github.com/Stover-Distributed-Systems-Incorporated/Ogma/tree/main/macos#readme) for full documentation."
 
 # ── Build assets ─────────────────────────────────────────────────────
 # Four assets: versioned + stable names for both the installer pkg and
 # the source zip, so releases/latest/download/Ogma.pkg always works.
 _TMPDIR=$(mktemp -d)
+trap 'rm -rf "$_TMPDIR"' EXIT
 ASSET_NAME="ogma-${TAG}.zip"
 ZIP="$_TMPDIR/$ASSET_NAME"
 STABLE_ZIP="$_TMPDIR/ogma.zip"
-git -C "$SCRIPT_DIR" archive --format=zip --prefix=ogma/ HEAD -o "$ZIP"
+# Package only the macOS product now that the repository is multi-platform.
+git -C "$SCRIPT_DIR" archive --format=zip --prefix=ogma/ HEAD:macos -o "$ZIP"
+# Include the repository license in the standalone macOS source download.
+mkdir -p "$_TMPDIR/source/ogma"
+git -C "$SCRIPT_DIR/.." archive --format=tar HEAD LICENSE | tar -xf - -C "$_TMPDIR/source/ogma"
+(cd "$_TMPDIR/source" && zip -q "$ZIP" ogma/LICENSE)
 cp "$ZIP" "$STABLE_ZIP"
 
 echo "Building installer pkg..."
@@ -75,24 +95,14 @@ bash "$SCRIPT_DIR/build-pkg.sh" "$VERSION"
 PKG="$SCRIPT_DIR/dist/Ogma-$VERSION.pkg"
 STABLE_PKG="$SCRIPT_DIR/dist/Ogma.pkg"
 
-# ── Create or update release ─────────────────────────────────────────
-if gh release view "$TAG" &>/dev/null; then
-    echo "Updating existing release $TAG..."
-    gh release edit "$TAG" --title "Ogma $TAG" --notes "$NOTES"
-    # Remove old assets (both old and new naming conventions)
-    for asset in ogma.zip "$ASSET_NAME" Ogma.pkg "Ogma-$VERSION.pkg"; do
-        gh release delete-asset "$TAG" "$asset" --yes 2>/dev/null || true
-    done
-    gh release upload "$TAG" "$PKG" "$STABLE_PKG" "$ZIP" "$STABLE_ZIP"
-else
-    echo "Creating draft release $TAG..."
-    gh release create "$TAG" "$PKG" "$STABLE_PKG" "$ZIP" "$STABLE_ZIP" \
-        --title "Ogma $TAG" \
-        --draft \
-        --notes "$NOTES"
-fi
-
-rm -rf "$_TMPDIR"
+# ── Create the new release ───────────────────────────────────────────
+printf '%s\n' "$NOTES" > "$_TMPDIR/release-notes.md"
+echo "Creating draft release $TAG at $REVISION..."
+gh release create "$TAG" "$PKG" "$STABLE_PKG" "$ZIP" "$STABLE_ZIP" \
+    --target "$REVISION" \
+    --title "Ogma $TAG" \
+    --draft \
+    --notes-file "$_TMPDIR/release-notes.md"
 
 echo ""
 echo "Release $TAG ready."

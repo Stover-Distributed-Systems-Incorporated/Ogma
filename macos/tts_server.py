@@ -23,13 +23,14 @@ import traceback
 
 # ── Paths ────────────────────────────────────────────────────────────
 
-DATA_DIR = os.path.expanduser("~/.local/share/ogma")
+DATA_DIR = os.environ.get("OGMA_DATA_DIR") or os.path.expanduser("~/.local/share/ogma")
 SOCKET_PATH = os.path.join(DATA_DIR, "tts.sock")
 PID_FILE = os.path.join(DATA_DIR, "tts_server.pid")
 LOCK_FILE = os.path.join(DATA_DIR, "tts_server.lock")
 LOG_FILE = os.path.join(DATA_DIR, "tts.log")
 STATE_FILE = os.path.join(DATA_DIR, "tts_state.json")
-CONFIG_FILE = os.path.expanduser("~/.config/ogma/config")
+CONFIG_FILE = (os.path.join(DATA_DIR, "config") if os.environ.get("OGMA_DATA_DIR")
+               else os.path.expanduser("~/.config/ogma/config"))
 
 # Idle timeout: the model is released after this long with no requests,
 # freeing ~350 MB.  Resolved fresh on each check (see effective_timeout) so
@@ -43,9 +44,9 @@ def _config_idle_timeout():
     try:
         with open(CONFIG_FILE) as f:
             for line in f:
-                line = line.strip()
-                if line.startswith("LOCAL_IDLE_TIMEOUT"):
-                    return line.split("=", 1)[1].strip().strip("\"'")
+                key, separator, value = line.strip().partition("=")
+                if separator and key.strip() == "LOCAL_IDLE_TIMEOUT":
+                    return value.strip().strip("\"'")
     except OSError:
         pass
     return None
@@ -58,7 +59,7 @@ def effective_timeout():
     for source in (_config_idle_timeout(), os.environ.get("OGMA_IDLE_TIMEOUT")):
         try:
             v = int(source)
-            if v >= MIN_IDLE_TIMEOUT:
+            if MIN_IDLE_TIMEOUT <= v <= 86400:
                 return v
         except (TypeError, ValueError):
             continue
@@ -85,6 +86,10 @@ last_request_time = time.time()
 server_socket = None
 shutdown_event = threading.Event()
 managed_mode = False
+activity_lock = threading.Lock()
+active_requests = 0
+last_activity = time.monotonic()
+state_write_lock = threading.Lock()
 
 
 def write_state():
@@ -95,10 +100,11 @@ def write_state():
     """
     try:
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"idle_timeout": effective_timeout(),
-                       "last_request": last_request_time}, f)
-        os.replace(tmp, STATE_FILE)
+        with state_write_lock:
+            with open(tmp, "w") as f:
+                json.dump({"idle_timeout": effective_timeout(),
+                           "last_request": last_request_time}, f)
+            os.replace(tmp, STATE_FILE)
     except OSError:
         pass
 generation_lock = threading.Lock()
@@ -251,8 +257,13 @@ def _client_gone(conn):
 
 def handle_client(conn):
     """Read one JSON request, generate audio, send JSON response."""
-    global last_request_time
-    last_request_time = time.time()
+    global last_request_time, last_activity, active_requests
+    with activity_lock:
+        if shutdown_event.is_set():
+            conn.close()
+            return
+        active_requests += 1
+        last_request_time = time.time()
 
     try:
         data = b""
@@ -262,6 +273,8 @@ def handle_client(conn):
             if not chunk:
                 break
             data += chunk
+            if len(data) > 1024 * 1024:
+                raise ValueError("TTS request exceeds 1 MiB")
             if b"\n" in data:
                 break
 
@@ -311,8 +324,14 @@ def handle_client(conn):
 
         import mlx.core as mx
 
-        gc.collect()
-        mx.metal.clear_cache()
+        with generation_lock:
+            gc.collect()
+            mx.metal.clear_cache()
+        with activity_lock:
+            active_requests -= 1
+            last_activity = time.monotonic()
+            last_request_time = time.time()
+        write_state()
 
 
 # ── Idle watchdog ────────────────────────────────────────────────────
@@ -326,8 +345,14 @@ def idle_watchdog():
     countdown stays accurate."""
     while not shutdown_event.is_set():
         timeout = effective_timeout()
-        remaining = timeout - (time.time() - last_request_time)
-        if remaining <= 0:
+        with activity_lock:
+            remaining = timeout - (time.monotonic() - last_activity)
+            should_stop = active_requests == 0 and remaining <= 0
+            if should_stop:
+                shutdown_event.set()
+            elif active_requests:
+                remaining = timeout
+        if should_stop:
             log(f"idle for {timeout}s, shutting down")
             do_shutdown()
             return
@@ -388,11 +413,13 @@ def handle_signal(signum, _frame):
 
 
 def main():
-    global server_socket, managed_mode, last_request_time
+    global server_socket, managed_mode, last_request_time, last_activity
 
     managed_mode = "--managed" in sys.argv[1:]
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.umask(0o077)
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
 
     # Acquire exclusive lock — guarantees at most one daemon runs.
     # The lock is held for the lifetime of the process and released
@@ -420,7 +447,11 @@ def main():
 
     for d in glob.glob(os.path.join(tempfile.gettempdir(), "ogma_tts_*")):
         try:
-            shutil.rmtree(d, ignore_errors=True)
+            # A previous request's clips may still be playing or cached by
+            # the speed reader when the daemon reloads.
+            if (not os.path.islink(d) and os.stat(d).st_uid == os.getuid()
+                    and time.time() - os.stat(d).st_mtime > 86400):
+                shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
 
@@ -437,6 +468,7 @@ def main():
     # Model load can take seconds — reset the idle clock to now and publish
     # initial state so the menu countdown starts from the full timeout.
     last_request_time = time.time()
+    last_activity = time.monotonic()
     write_state()
 
     # The idle watchdog runs in every mode so the model is released after
@@ -450,6 +482,7 @@ def main():
     # socket file to appear).
     server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_socket.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
     server_socket.listen(2)
     server_socket.settimeout(5)
 

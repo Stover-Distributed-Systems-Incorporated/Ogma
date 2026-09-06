@@ -3,6 +3,7 @@
 # Double-click this file in Finder to run.
 
 set -e
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -25,7 +26,7 @@ _focus_terminal() {
 }
 
 # ── Single-instance guard ─────────────────────────────────────────
-_LOCKDIR="/tmp/ogma_install.lock"
+_LOCKDIR="${TMPDIR:-/tmp}/ogma_install_$(id -u).lock"
 if ! mkdir "$_LOCKDIR" 2>/dev/null; then
     _holder_pid=$(cat "$_LOCKDIR/pid" 2>/dev/null)
     if [ -n "$_holder_pid" ] && kill -0 "$_holder_pid" 2>/dev/null; then
@@ -92,7 +93,7 @@ unspin() {
 
 # ── Welcome ───────────────────────────────────────────────────────
 result=$(osascript -e 'button returned of (display dialog "Welcome to Ogma!\n\nThis installer will:\n  • Copy the speak script into ~/.local/bin\n  • Build a menu bar app that registers ⌥⇧/ as a global hotkey\n  • Optionally install local TTS for free offline use (Apple Silicon)" with title "Ogma" buttons {"Quit", "Continue"} default button "Continue" with icon note)' 2>/dev/null || true)
-[ "$result" = "Quit" ] && exit 0
+[ "$result" = "Continue" ] || exit 0
 _focus_terminal
 
 # ── Architecture detection ───────────────────────────────────────

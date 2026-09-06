@@ -6,21 +6,28 @@ Every change must be consistent with these rules.
 
 ## Architecture
 
-Ogma has four components:
+Ogma's main components:
 
 | Component | Language | Role |
 |---|---|---|
 | `speak.sh` | Bash | TTS orchestrator. Reads text, splits into sentences, generates audio, plays it. |
 | `Ogma.swift` | Swift/AppKit | Menu bar app. Global hotkey, settings UI, config file, respeak. |
 | `tts_server.py` | Python | Persistent Kokoro daemon. Keeps the model in memory for instant response. |
+| `stt_server.py` | Python | Local Parakeet/Voxtral recognition over a framed Unix-socket stream. |
+| `normalize.py` | Python | PDF, LaTeX, and Markdown cleanup before TTS. |
 | `install.command` | Bash | Interactive installer. Dialogs, backend choice, CLT auto-update, Keychain, app compile. |
 | `ogma-audio.swift` | Swift | CoreAudio CLI. Sub-millisecond mute check and unmute for standalone use. |
 
-Data flows one way: **Swift -> speak.sh -> tts_server.py**.
+The read-aloud path is **Swift -> speak.sh -> tts_server.py**.
 The Swift app checks mute state via CoreAudio in-process (microseconds), then
 launches speak.sh as a subprocess with `OGMA_MUTE_CHECKED=1`. speak.sh
 connects to the daemon over a Unix socket. There is no reverse communication
 except through shared files (TEXT_FILE, STATUS_FILE, config).
+
+Dictation uses a separate bidirectional stream: Swift sends microphone frames
+to `stt_server.py` and receives partial/final JSON transcripts. Cancel shuts down
+the connection without an end marker; interrupted sessions may offer available
+partials for manual review, but must not send them to an LLM automatically.
 
 
 ## Backend model
@@ -43,12 +50,9 @@ or `both`). Silent fallback only happens when `both` is installed.
 
     environment variable > config file > hardcoded default
 
-speak.sh saves env vars before sourcing the config to implement this:
-```
-_ENV_X="${X:-}"
-source "$_CONFIG"
-X="${_ENV_X:-${X:-default}}"
-```
+speak.sh parses plain `KEY=value` lines without executing them. Never source
+or evaluate the user-editable config. Swift preserves unknown helper settings
+when saving and prevents multiline field values from creating additional keys.
 
 Swift writes the config file. speak.sh reads it. Both parse the same format:
 `KEY="value"` lines, comments starting with `#`.
@@ -448,6 +452,15 @@ Color-coded output: green (<10ms), yellow (10-100ms), red (>100ms).
 
 
 ## Rules for changes
+
+Local IPC uses private data directories (0700) and sockets (0600). Bound incoming
+headers, audio frames, and pending microphone data. Daemon idle clocks use
+monotonic time and must not unload a model while a request is active. Serialize
+state-file writers as well as model generation.
+
+Selection-based hotkeys require a fresh Copy result. Never turn a failed Copy
+into implicit permission to read the previous clipboard value. Delayed starts,
+playback completion, and transcript insertion must honor cancellation generations.
 
 1. **Default values must match** across speak.sh, Ogma.swift, install.command, and tts_server.py.
 

@@ -67,6 +67,15 @@ elif [ "$_DEP_HASH" != "$(cat "$_STAMP" 2>/dev/null)" ]; then
 fi
 export VENV_PYTHON="$DEV_VENV/bin/python3"
 
+# Product integration tests must never write the installed app's logs, PID
+# files, or playback text, or pick up a user's personal configuration.
+_SUITE_DIR=$(mktemp -d /tmp/ogma-suite.XXXXXX)
+export OGMA_DATA_DIR="$_SUITE_DIR/data"
+export OGMA_CONFIG_FILE="$_SUITE_DIR/config"
+export TMPDIR="$_SUITE_DIR/"
+mkdir -p "$OGMA_DATA_DIR"
+trap 'rm -rf "$_SUITE_DIR"' EXIT
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 check() {
@@ -1406,6 +1415,8 @@ check "runSpeak: every flag-clear is generation-guarded (0 unguarded)" \
 # stopSpeaking is the manual-stop path; it must always clear.
 check "stopSpeaking: clears isSpeakingFlag" \
     "yes" "$(awk '/func stopSpeaking/,/^    \}/' "$SETTINGS_SWIFT" \
+        | grep -q 'killCurrentProcess()' && \
+        awk '/func killCurrentProcess/,/^    \}/' "$SETTINGS_SWIFT" \
         | grep -q 'isSpeakingFlag = false' && echo "yes" || echo "no")"
 
 # ── Invariant 8: scheduleRespeak guards on the flag ─────────────
@@ -2880,7 +2891,7 @@ check "toggle uses pkill -P to kill children first" \
 
 # Toggle only kills if process is alive (kill follows kill -0 check)
 check "toggle kill is inside if kill -0 block" \
-    "yes" "$(grep -A 5 'kill -0.*OLD_PID.*then' "$SPEAK_SH" | grep -q 'kill "\$OLD_PID"' && echo "yes" || echo "no")"
+    "yes" "$(grep -A 6 'kill -0.*OLD_PID' "$SPEAK_SH" | grep -q 'kill "\$OLD_PID"' && echo "yes" || echo "no")"
 
 # Toggle waits for old process to die before proceeding
 check "toggle waits for old process to die" \
@@ -4987,11 +4998,13 @@ _run_with_timeout() {
     _tout_file=$(mktemp "${TMPDIR:-/tmp}/ogma_tout_XXXXXXXXXX")
     "$@" > "$_tout_file" 2>/dev/null &
     local _bg=$!
-    ( sleep "$_secs"; kill "$_bg" 2>/dev/null ) &
+    ( sleep "$_secs"; pkill -TERM -P "$_bg" 2>/dev/null || true; kill "$_bg" 2>/dev/null || true ) &
     local _wdog=$!
     _TIMEOUT_EXIT=0
     wait "$_bg" 2>/dev/null || _TIMEOUT_EXIT=$?
-    kill "$_wdog" 2>/dev/null; wait "$_wdog" 2>/dev/null || true
+    pkill -TERM -P "$_wdog" 2>/dev/null || true
+    kill "$_wdog" 2>/dev/null || true
+    wait "$_wdog" 2>/dev/null || true
     _TIMEOUT_OUT=$(cat "$_tout_file" 2>/dev/null)
     rm -f "$_tout_file"
 }
@@ -5017,11 +5030,9 @@ if ! $FAST; then
         check "ogma-audio compiles with play-queue support" "true" "false"
     fi
 else
-    # Fast mode: use pre-compiled binary if available
-    if [ -x "$HOME/.local/bin/ogma-audio" ]; then
-        _QP_BIN="$HOME/.local/bin/ogma-audio"
-        _QP_COMPILED=true
-    fi
+    # The installed helper may be a different version and accesses real audio
+    # devices. Fast checks must only exercise this checkout's source.
+    printf "  SKIP  audio-device playback (--fast mode)\n"
 fi
 
 if $_QP_COMPILED; then

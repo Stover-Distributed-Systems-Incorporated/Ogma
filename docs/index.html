@@ -205,8 +205,8 @@
         Runs in your menu bar.
       </p>
       <div class="buttons">
-        <a href="https://github.com/smcantab/ogma/releases/latest/download/ogma.zip" class="cta" id="dl">Download</a>
-        <a href="https://github.com/smcantab/ogma" class="secondary">View on GitHub</a>
+        <a href="https://github.com/Stover-Distributed-Systems-Incorporated/Ogma/releases/latest/download/ogma.zip" class="cta" id="dl">Download</a>
+        <a href="https://github.com/Stover-Distributed-Systems-Incorporated/Ogma" class="secondary">View on GitHub</a>
       </div>
       <p class="prereq">Requires macOS 13+. ElevenLabs needs an API key. Local TTS needs Apple Silicon.</p>
     </div>
@@ -287,7 +287,7 @@
 
   <footer>
     A fork of <a href="https://speakeleven.com">Speak11</a> by <a href="https://github.com/smcantab">Stefano Martiniani</a> ·
-    <a href="https://github.com/smcantab/ogma">GitHub</a> ·
+    <a href="https://github.com/Stover-Distributed-Systems-Incorporated/Ogma">GitHub</a> ·
     <a href="https://elevenlabs.io/pricing">ElevenLabs pricing</a> ·
     macOS 13+
   </footer>
@@ -295,7 +295,7 @@
     // Resolve versioned download URL on page load; fall back to ogma.zip href.
     (function() {
       var btn = document.getElementById('dl');
-      fetch('https://api.github.com/repos/smcantab/ogma/releases/latest')
+      fetch('https://api.github.com/repos/Stover-Distributed-Systems-Incorporated/Ogma/releases/latest')
         .then(function(r) { return r.json(); })
         .then(function(data) {
           var asset = (data.assets || []).find(function(a) {

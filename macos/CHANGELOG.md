@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.4.3
+
+- Prevent large read-aloud selections from blocking before the speech process starts; protect newer playback from stale completions and delayed restarts.
+- Read-aloud and speed reading now require a fresh Copy result instead of falling back to unrelated clipboard text. Cancel also invalidates pending selection capture, transcript delivery, and paced typing.
+- Report local dictation connection errors promptly, recover available partial transcripts into the review card, bound buffered audio, and interrupt socket writes on cancellation.
+- Guard immediate insertion and paced typing against observable focus changes, including switching fields within the same application.
+- Keep local speech models loaded throughout active requests. Restrict daemon data and sockets to the current user; validate audio frames and request sizes; serialize daemon state-file updates.
+- Fix audio queue hangs on missing/unplayable files and report playback timestamps when playback actually begins.
+- Validate numeric configuration, preserve helper settings, prevent multiline configuration injection, support IPv6 loopback rewrite endpoints, and preserve the first line of unlabelled fenced rewrite output.
+- Replace bundled helpers atomically; preserve an existing Python environment when a repair fails; retain background installation logs; avoid caching incomplete dictionary downloads; remove the normalization helper during uninstall.
+- Isolate regression tests from the installed application's configuration and runtime files. Add model-free Python, shell, and native Swift regressions.
+- Move the macOS product into `macos/`. Release builds now require committed macOS sources, target the exact build revision, include the license in source downloads, and refuse to overwrite an existing release.
+
 ## v2.4.2
 
 ### Bug fixes

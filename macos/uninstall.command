@@ -61,6 +61,7 @@ rm -f "$HOME/.local/bin/stt_server.py"
 rm -f "$HOME/.local/bin/install-local.sh"
 rm -f "$HOME/.local/bin/uninstall.command"
 rm -f "$HOME/.local/bin/ogma-audio"
+rm -f "$HOME/.local/bin/normalize.py"
 step "Scripts removed"
 
 # ── Remove the Services workflow ──────────────────────────────────

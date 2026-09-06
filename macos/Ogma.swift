@@ -45,7 +45,7 @@ private func runPasteboardSnapshotSelfTest() -> Bool {
 
 // MARK: - Config model
 
-struct Config {
+struct Config: Equatable {
     // Keep comments and settings owned by other helpers (for example
     // FILTER_FILLERS) when the menu writes its own settings back out.
     private var preservedLines: [String] = []
@@ -109,9 +109,9 @@ struct Config {
     // visual timer. Local (Kokoro) only. Swift-only key.
     var speedReadAudio:  Bool   = false
 
-    static func load() -> Config {
+    static func load(from path: String = configPath) -> Config {
         var c = Config()
-        guard let raw = try? String(contentsOfFile: configPath, encoding: .utf8) else { return c }
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return c }
         for originalLine in raw.components(separatedBy: .newlines) {
             let line = originalLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty, !line.hasPrefix("#"),
@@ -176,12 +176,30 @@ struct Config {
             default:                     c.preservedLines.append(originalLine)
             }
         }
+        // User-editable numbers must not reach timers, integer conversions,
+        // or JSON as NaN/infinity or out-of-range values.
+        func bounded(_ value: Double, _ range: ClosedRange<Double>, _ fallback: Double) -> Double {
+            value.isFinite ? min(max(value, range.lowerBound), range.upperBound) : fallback
+        }
+        c.speed = bounded(c.speed, 0.7...1.2, 1)
+        c.localSpeed = bounded(c.localSpeed, 0.5...2, 1)
+        c.stability = bounded(c.stability, 0...1, 0.5)
+        c.similarityBoost = bounded(c.similarityBoost, 0...1, 0.75)
+        c.style = bounded(c.style, 0...1, 0)
+        c.localIdleTimeout = min(max(c.localIdleTimeout, 5), 86400)
+        c.sttIdleTimeout = min(max(c.sttIdleTimeout, 5), 86400)
+        c.sentencePause = min(max(c.sentencePause, 0), 10000)
+        c.wpm = min(max(c.wpm, 50), 2000)
+        if !["auto", "elevenlabs", "local"].contains(c.ttsBackend) { c.ttsBackend = "auto" }
+        if !["elevenlabs", "local", "both"].contains(c.backendsInstalled) { c.backendsInstalled = "elevenlabs" }
+        if !["parakeet", "voxtral"].contains(c.sttEngine) { c.sttEngine = "parakeet" }
         return c
     }
 
-    func save() {
+    func save(to path: String = configPath) {
         try? FileManager.default.createDirectory(
-            atPath: configDir, withIntermediateDirectories: true, attributes: nil)
+            atPath: (path as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let lines = [
             "TTS_BACKEND=\"\(ttsBackend)\"",
             "TTS_BACKENDS_INSTALLED=\"\(backendsInstalled)\"",
@@ -212,7 +230,10 @@ struct Config {
             "WPM=\"\(wpm)\"",
             "SPEED_READ_AUDIO=\"\(speedReadAudio ? "true" : "false")\"",
         ]
-        var output = lines
+        // Pasted multiline model/voice names must not create extra settings.
+        var output = lines.map {
+            $0.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
+        }
         let preserved = preservedLines
             .drop(while: { $0.trimmingCharacters(in: .whitespaces).isEmpty })
             .reversed()
@@ -223,7 +244,8 @@ struct Config {
             output.append(contentsOf: preserved)
         }
         try? (output.joined(separator: "\n") + "\n")
-            .write(toFile: configPath, atomically: true, encoding: .utf8)
+            .write(toFile: path, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
     }
 }
 
@@ -283,7 +305,8 @@ private enum IntentRewriteClient {
         """
 
     static func isLoopbackEndpoint(_ raw: String) -> Bool {
-        guard let host = URLComponents(string: raw)?.host?.lowercased() else { return false }
+        guard let rawHost = URLComponents(string: raw)?.host?.lowercased() else { return false }
+        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         if host == "localhost" || host == "::1" { return true }
         let octets = host.split(separator: ".", omittingEmptySubsequences: false)
         guard octets.count == 4, octets.first == "127" else { return false }
@@ -445,14 +468,13 @@ private enum IntentRewriteClient {
         // Tolerate small local models that ignore the no-Markdown instruction.
         if result.hasPrefix("```"), result.hasSuffix("```") {
             result = String(result.dropFirst(3).dropLast(3))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
             if let newline = result.firstIndex(of: "\n") {
                 let possibleLanguage = result[..<newline]
-                if !possibleLanguage.contains(" ") && possibleLanguage.count < 20 {
+                if ["text", "plaintext", "markdown", "md"].contains(String(possibleLanguage)) {
                     result = String(result[result.index(after: newline)...])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             }
+            result = result.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard !result.isEmpty else { throw IntentRewriteError.emptyResponse }
         let maximumLength = max(original.count * 4, original.count + 500)
@@ -732,6 +754,7 @@ private weak var appDelegateRef: AppDelegate?
 // loop; read on the main thread). Used to avoid stealing keyboard focus for
 // the review card while the user is typing.
 private var lastUserKeyDownAt: CFAbsoluteTime = 0
+private let hotkeyQueue = DispatchQueue(label: "ogma.hotkeys", qos: .userInitiated)
 
 private let hotkeyCallback: CGEventTapCallBack = { _, type, event, _ in
     // If the tap was disabled (e.g. callback was too slow), re-enable it.
@@ -756,7 +779,7 @@ private let hotkeyCallback: CGEventTapCallBack = { _, type, event, _ in
     guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return nil }
 
     // Fire on a background thread — never block the event tap.
-    DispatchQueue.global(qos: .userInitiated).async {
+    hotkeyQueue.async {
         if code == kCancelHotkeyCode {
             appDelegateRef?.handleCancelHotkey()
         } else if code == kDictateHotkeyCode {
@@ -787,28 +810,42 @@ struct STTWord {
 
 final class STTStreamClient {
     private var fd: Int32 = -1
+    private let socketLock = NSLock()
     private var pending: [Data] = []
-    private var closed = false     // guarded by sendQueue
+    private var pendingBytes = 0   // guarded by sendQueue
+    private var queuedBytes = 0    // guarded by socketLock
+    private var closed = false     // guarded by socketLock
     private var finished = false   // guarded by sendQueue
     private let sendQueue = DispatchQueue(label: "ogma.stt.send")
     var onPartial: ((String, [STTWord]) -> Void)?
     var onFinal: ((String, [STTWord]) -> Void)?
+    var onFailure: ((String) -> Void)?
 
     // True once close() ran. The connect poller checks this to stop early;
     // connect() itself re-checks on sendQueue, which closes the race — a
     // closed client can never adopt a socket and wedge the single-flight
     // daemon with a dead stream.
-    var isClosed: Bool { sendQueue.sync { closed } }
+    var isClosed: Bool {
+        socketLock.lock(); defer { socketLock.unlock() }
+        return closed
+    }
 
     func connect(socketPath: String, sampleRate: Int, wantsPartials: Bool) -> Bool {
+        guard socketPath.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
+            fail("The speech service socket path is too long.")
+            return false
+        }
         let s = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard s >= 0 else { return false }
+        guard s >= 0 else { fail("Could not open the speech service connection."); return false }
         // Without this, a daemon dying mid-stream (e.g. unloaded from the
         // menu while dictating) raises SIGPIPE on the next send and kills
         // the whole app; with it, send just returns EPIPE.
         var noSigpipe: Int32 = 1
         setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe,
                    socklen_t(MemoryLayout<Int32>.size))
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                   socklen_t(MemoryLayout<timeval>.size))
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let cap = MemoryLayout.size(ofValue: addr.sun_path)
@@ -824,21 +861,34 @@ final class STTStreamClient {
                 Darwin.connect(s, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard r == 0 else { Darwin.close(s); return false }
+        guard r == 0 else {
+            Darwin.close(s)
+            fail("The local speech service could not start. Check the speech model installation.")
+            return false
+        }
 
         var adopted = false
         sendQueue.sync {
-            guard !self.closed else { Darwin.close(s); return }
+            self.socketLock.lock()
+            guard !self.closed, self.fd < 0 else {
+                self.socketLock.unlock(); Darwin.close(s); return
+            }
             self.fd = s
+            self.socketLock.unlock()
+            // The reader owns this exact descriptor, even if Cancel runs
+            // before this block finishes flushing buffered microphone audio.
+            self.startReading(readFd: s)
             let header = "{\"mode\":\"stream\",\"sample_rate\":\(sampleRate),"
                 + "\"want_partials\":\(wantsPartials)}\n"
-            _ = self.writeAll(Data(header.utf8))
-            for f in self.pending { _ = self.writeAll(f) }
+            guard self.writeAll(Data(header.utf8)) else { return }
+            for f in self.pending {
+                if !self.writeAll(f) { break }
+            }
             self.pending.removeAll()
+            self.pendingBytes = 0
             adopted = true
         }
         guard adopted else { return false }
-        startReading()
         return true
     }
 
@@ -847,72 +897,124 @@ final class STTStreamClient {
         var len = UInt32(samples.count * 4).bigEndian
         var frame = Data(bytes: &len, count: 4)
         samples.withUnsafeBytes { frame.append(contentsOf: $0) }
+        socketLock.lock()
+        guard !closed else { socketLock.unlock(); return }
+        guard queuedBytes + frame.count <= 4 * 1024 * 1024 else {
+            socketLock.unlock()
+            fail("The speech service is not keeping up. Please try again.")
+            return
+        }
+        queuedBytes += frame.count
+        socketLock.unlock()
         sendQueue.async {
-            guard !self.closed, !self.finished else { return }
-            if self.fd >= 0 { _ = self.writeAll(frame) }
-            else { self.pending.append(frame) }
+            defer {
+                self.socketLock.lock()
+                self.queuedBytes -= frame.count
+                self.socketLock.unlock()
+            }
+            guard !self.isClosed, !self.finished else { return }
+            if self.connectedDescriptor >= 0 { _ = self.writeAll(frame) }
+            else if self.pendingBytes + frame.count <= 4 * 1024 * 1024 {
+                self.pending.append(frame)
+                self.pendingBytes += frame.count
+            } else {
+                self.fail("The speech model did not become ready in time. Please try again.")
+            }
         }
     }
 
     func finish() {
         sendQueue.async {
-            guard !self.closed, !self.finished else { return }
+            guard !self.isClosed, !self.finished else { return }
             self.finished = true
             var zero = UInt32(0).bigEndian
             let frame = Data(bytes: &zero, count: 4)
             // Not connected yet (daemon still loading): queue the terminator
             // so the flush-on-connect still ends the stream and a final comes
             // back — instead of silently dropping it.
-            if self.fd >= 0 { _ = self.writeAll(frame) }
+            if self.connectedDescriptor >= 0 { _ = self.writeAll(frame) }
             else { self.pending.append(frame) }
         }
     }
 
     func close() {
-        sendQueue.async {
-            self.closed = true
-            self.pending.removeAll()
-            if self.fd >= 0 {
-                // shutdown only — the read thread owns the descriptor and
-                // closes it when recv() returns. Closing here would free the
-                // fd number for reuse while the reader still holds it, letting
-                // a stale reader consume a NEWER session's stream.
-                Darwin.shutdown(self.fd, SHUT_RDWR)
-                self.fd = -1
-            }
+        terminate(error: nil)
+    }
+
+    private var connectedDescriptor: Int32 {
+        socketLock.lock(); defer { socketLock.unlock() }
+        return fd
+    }
+
+    private func fail(_ message: String) {
+        terminate(error: message)
+    }
+
+    private func terminate(error: String?) {
+        socketLock.lock()
+        guard !closed else { socketLock.unlock(); return }
+        closed = true
+        if fd >= 0 {
+            // Shutdown is immediate, even if sendQueue is blocked writing.
+            // Actual close is serialized after writes by the reader below.
+            Darwin.shutdown(fd, SHUT_RDWR)
+            fd = -1
         }
+        socketLock.unlock()
+        sendQueue.async {
+            self.pending.removeAll()
+            self.pendingBytes = 0
+        }
+        if let error { onFailure?(error) }
     }
 
     // Must be called on sendQueue.
     private func writeAll(_ data: Data) -> Bool {
+        let socketFD = connectedDescriptor
+        guard socketFD >= 0, !isClosed else { return false }
         var ok = true
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard var ptr = raw.baseAddress else { return }
             var remaining = raw.count
             while remaining > 0 {
-                let n = Darwin.send(self.fd, ptr, remaining, 0)
+                let n = Darwin.send(socketFD, ptr, remaining, 0)
+                if n < 0 && errno == EINTR { continue }
                 if n <= 0 { ok = false; break }
                 ptr = ptr.advanced(by: n); remaining -= n
             }
         }
+        if !ok { fail("The speech service connection was interrupted. Please try again.") }
         return ok
     }
 
-    private func startReading() {
-        let readFd = fd
-        Thread.detachNewThread { [weak self] in
+    private func startReading(readFd: Int32) {
+        Thread.detachNewThread { [self] in
             var buf = Data()
             var tmp = [UInt8](repeating: 0, count: 8192)
-            defer { Darwin.close(readFd) }   // reader owns the fd; see close()
+            var receivedFinal = false
+            defer {
+                if !receivedFinal { fail("The speech service stopped before returning a transcript.") }
+                close()
+                sendQueue.async { Darwin.close(readFd) }
+            }
             while true {
                 let n = tmp.withUnsafeMutableBytes { recv(readFd, $0.baseAddress, $0.count, 0) }
+                if n < 0 && errno == EINTR { continue }
                 if n <= 0 { break }
                 buf.append(contentsOf: tmp[0..<n])
+                guard buf.count <= 8 * 1024 * 1024 else {
+                    fail("The speech service returned an oversized response.")
+                    return
+                }
                 while let idx = buf.firstIndex(of: 0x0A) {
                     let line = buf.subdata(in: buf.startIndex..<idx)
                     buf.removeSubrange(buf.startIndex...idx)
                     guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
                     else { continue }
+                    if obj["status"] as? String == "error" {
+                        fail("Local transcription failed. Please check the speech service log and try again.")
+                        return
+                    }
                     // "words" is absent when talking to an older daemon —
                     // callers render plain text then.
                     let words = (obj["words"] as? [[String: Any]])?.compactMap { w -> STTWord? in
@@ -922,9 +1024,11 @@ final class STTStreamClient {
                                        suggestion: w["suggestion"] as? String)
                     } ?? []
                     if let f = obj["final"] as? String {
-                        self?.onFinal?(f, words)
+                        receivedFinal = true
+                        onFinal?(f, words)
+                        return
                     }
-                    else if let p = obj["partial"] as? String { self?.onPartial?(p, words) }
+                    else if let p = obj["partial"] as? String { onPartial?(p, words) }
                 }
             }
         }
@@ -2578,6 +2682,8 @@ private final class RecordingIndicatorOverlay: NSObject {
     private var isSpeakingFlag = false
     private var respeakTimer: Timer?
     private let speakLock = NSLock()
+    // Invalidates selection capture and delayed delivery when Cancel is pressed.
+    private var selectionGeneration = 0
 
     // Credits cache (fetched from ElevenLabs API)
     private var cachedCredits: (used: Int, limit: Int, fetchedAt: Date)?
@@ -2587,9 +2693,12 @@ private final class RecordingIndicatorOverlay: NSObject {
 
     // STT (dictation) state
     private var sttDaemonProcess: Process?
+    private var localInstallInProgress = false
     private var audioEngine: AVAudioEngine?
     private var audioConverter: AVAudioConverter?
     private var sttClient: STTStreamClient?
+    private var lastPartialTranscript = ""
+    private var lastPartialWords: [STTWord] = []
     private let overlay = DictationOverlay()
     private let recordingOverlay = RecordingIndicatorOverlay()
 
@@ -2612,6 +2721,7 @@ private final class RecordingIndicatorOverlay: NSObject {
     // The app that had focus when dictation started — reactivated before the
     // paste, since the review card takes key focus in between.
     private var dictationTargetApp: NSRunningApplication?
+    private var dictationTargetElement: AXUIElement?
     private let recordLock = NSLock()
     private var intentRewriteTask: URLSessionDataTask?
     private var intentRewriteGeneration = 0
@@ -2720,13 +2830,7 @@ private final class RecordingIndicatorOverlay: NSObject {
     // config file).
     func menuWillOpen(_ menu: NSMenu) {
         let fresh = Config.load()
-        if fresh.backendsInstalled != config.backendsInstalled ||
-           fresh.ttsBackend != config.ttsBackend ||
-           fresh.sttEnginesInstalled != config.sttEnginesInstalled ||
-           fresh.sttEngine != config.sttEngine ||
-           fresh.dictationInsertMode != config.dictationInsertMode ||
-           fresh.dictationTypingWPM != config.dictationTypingWPM ||
-           fresh.recordingIndicator != config.recordingIndicator {
+        if fresh != config {
             config = fresh
             rebuildMenu()
             updateTTSDaemon()
@@ -2822,20 +2926,44 @@ private final class RecordingIndicatorOverlay: NSObject {
                 return
             }
 
-            // Simulate ⌘C directly via CGEvent so the settings app's own
-            // Accessibility grant is used.
-            let src = CGEventSource(stateID: .hidSystemState)
-            let cDown = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: true)
-            cDown?.flags = .maskCommand
-            let cUp   = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: false)
-            cUp?.flags = .maskCommand
-            cDown?.post(tap: .cgAnnotatedSessionEventTap)
-            cUp?.post(tap: .cgAnnotatedSessionEventTap)
-            // Wait for the clipboard to be updated before speak.sh reads it.
-            Thread.sleep(forTimeInterval: 0.2)
-
-            runSpeak()
+            DispatchQueue.main.async {
+                self.captureSelection { self.runSpeak(withText: $0) }
+            }
         }
+    }
+
+    // A failed Copy must never read an unrelated (possibly sensitive) old
+    // clipboard value. Wait for a new value from the same foreground app.
+    private func captureSelection(_ completion: @escaping (String) -> Void) {
+        selectionGeneration &+= 1
+        let generation = selectionGeneration
+        let pasteboard = NSPasteboard.general
+        let previousChange = pasteboard.changeCount
+        let targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        guard targetPID != nil, !IsSecureEventInputEnabled() else { NSSound.beep(); return }
+        let source = CGEventSource(stateID: .hidSystemState)
+        for down in [true, false] {
+            let event = CGEvent(keyboardEventSource: source, virtualKey: 8, keyDown: down)
+            event?.flags = .maskCommand
+            event?.post(tap: .cgAnnotatedSessionEventTap)
+        }
+        func poll(_ attempt: Int) {
+            guard generation == self.selectionGeneration else { return }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID,
+                  !IsSecureEventInputEnabled() else { return }
+            if pasteboard.changeCount != previousChange {
+                guard let text = pasteboard.string(forType: .string),
+                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    NSSound.beep(); return
+                }
+                completion(text)
+            } else if attempt < 20 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll(attempt + 1) }
+            } else {
+                self.overlay.flash("Select text first, then try again")
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll(0) }
     }
 
     // ⌥⇧R: flash the current selection word-by-word in a centered HUD overlay.
@@ -2854,19 +2982,17 @@ private final class RecordingIndicatorOverlay: NSObject {
         DispatchQueue.main.sync { text = self.overlay.selectedTranscriptText() }
 
         if (text ?? "").isEmpty {
-            // Synthesize ⌘C into the active app, then read the clipboard.
-            let src = CGEventSource(stateID: .hidSystemState)
-            let cDown = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: true)
-            cDown?.flags = .maskCommand
-            let cUp   = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: false)
-            cUp?.flags = .maskCommand
-            cDown?.post(tap: .cgAnnotatedSessionEventTap)
-            cUp?.post(tap: .cgAnnotatedSessionEventTap)
-            Thread.sleep(forTimeInterval: 0.2)
-            text = NSPasteboard.general.string(forType: .string)
+            DispatchQueue.main.async {
+                self.captureSelection { self.startSpeedReadSelection($0) }
+            }
+            return
         }
+        let selected = text ?? ""
+        DispatchQueue.main.async { self.startSpeedReadSelection(selected) }
+    }
 
-        let words = SpeedReadController.tokenize(text ?? "")
+    private func startSpeedReadSelection(_ text: String) {
+        let words = SpeedReadController.tokenize(text)
         guard !words.isEmpty else { NSSound.beep(); return }
         let wpm = config.wpm
         DispatchQueue.main.async {
@@ -2884,6 +3010,8 @@ private final class RecordingIndicatorOverlay: NSObject {
         // background queue. UI and dictation state remain main-thread-only.
         stopSpeaking()
         DispatchQueue.main.async {
+            self.selectionGeneration &+= 1
+            self.typingGeneration &+= 1
             self.cancelActiveDictation()
             self.rsvpOverlay?.stop()
             self.speedReader?.cancelPlayback()
@@ -2982,6 +3110,11 @@ private final class RecordingIndicatorOverlay: NSObject {
     // MARK: - Speak process management
 
     func runSpeak(withText text: String? = nil) {
+        // AppKit dialogs and daemon lifecycle state belong to the main queue.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.runSpeak(withText: text) }
+            return
+        }
         // Lazily load the local model on first use. It unloads itself after an
         // idle timeout, so this reloads it when needed. No-op for cloud
         // backends (needsDaemon) or when the daemon is already running.
@@ -3016,12 +3149,12 @@ private final class RecordingIndicatorOverlay: NSObject {
             task.environment  = ProcessInfo.processInfo.environment.merging(
                 ["OGMA_MUTE_CHECKED": "1"]) { _, new in new }
 
-            if let text = text {
-                let pipe = Pipe()
-                pipe.fileHandleForWriting.write(text.data(using: .utf8) ?? Data())
-                pipe.fileHandleForWriting.closeFile()
-                task.standardInput = pipe
+            let inputPipe: Pipe?
+            if text != nil {
+                inputPipe = Pipe()
+                task.standardInput = inputPipe
             } else {
+                inputPipe = nil
                 task.standardInput = FileHandle.nullDevice
             }
 
@@ -3057,16 +3190,29 @@ private final class RecordingIndicatorOverlay: NSObject {
                 return
             }
 
+            // Launch the reader before filling its pipe: selections larger
+            // than the kernel pipe buffer otherwise deadlock before launch.
+            if let pipe = inputPipe, let text = text {
+                do { try pipe.fileHandleForWriting.write(contentsOf: Data(text.utf8)) }
+                catch { /* Cancellation can close the reader during a write. */ }
+                try? pipe.fileHandleForWriting.close()
+            }
+
             task.waitUntilExit()
 
             speakLock.lock()
-            currentSpeakProcess = nil
             let currentGen = speakGeneration
-            if currentGen == gen { isSpeakingFlag = false }
+            if currentGen == gen {
+                currentSpeakProcess = nil
+                isSpeakingFlag = false
+            }
             speakLock.unlock()
 
             DispatchQueue.main.async {
-                if currentGen == gen { self.setSpeaking(false) }
+                self.speakLock.lock()
+                let stillCurrent = self.speakGeneration == gen
+                self.speakLock.unlock()
+                if stillCurrent { self.setSpeaking(false) }
             }
         }
     }
@@ -3076,6 +3222,7 @@ private final class RecordingIndicatorOverlay: NSObject {
         speakGeneration += 1
         let process = currentSpeakProcess
         currentSpeakProcess = nil  // prevent duplicate kill attempts
+        isSpeakingFlag = false
         speakLock.unlock()
 
         guard let process = process, process.isRunning else { return }
@@ -3143,6 +3290,8 @@ private final class RecordingIndicatorOverlay: NSObject {
               let timeout = (obj["idle_timeout"] as? NSNumber)?.doubleValue,
               let last = (obj["last_request"] as? NSNumber)?.doubleValue
         else { return nil }
+        guard timeout.isFinite, last.isFinite, (0...86400).contains(timeout),
+              abs(Date().timeIntervalSince1970 - last) < 31_536_000 else { return nil }
         return max(0, Int((timeout - (Date().timeIntervalSince1970 - last)).rounded()))
     }
 
@@ -3357,11 +3506,30 @@ private final class RecordingIndicatorOverlay: NSObject {
 
     // Stop whichever STT daemon is running via its PID file.
     private func unloadSTTModel() {
-        if let pidStr = try? String(contentsOfFile: sttPidPath, encoding: .utf8),
-           let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            kill(pid, SIGTERM)
-        }
+        terminateDaemon(pidPath: sttPidPath, scriptPath: sttServerPath)
         stopSTTDaemon()
+    }
+
+    private func terminateDaemon(pidPath: String, scriptPath: String) {
+        guard let raw = try? String(contentsOfFile: pidPath, encoding: .utf8),
+              let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 1 else { return }
+        // PID files outlive crashes; a reused PID must not kill another app.
+        let inspect = Process()
+        inspect.executableURL = URL(fileURLWithPath: "/bin/ps")
+        inspect.arguments = ["-p", String(pid), "-o", "args="]
+        let output = Pipe()
+        inspect.standardOutput = output
+        inspect.standardError = FileHandle.nullDevice
+        do { try inspect.run() } catch { return }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        inspect.waitUntilExit()
+        guard inspect.terminationStatus == 0,
+              let command = String(data: data, encoding: .utf8),
+              command.contains(" " + scriptPath + " ")
+                || command.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(" " + scriptPath)
+        else { return }
+        kill(pid, SIGTERM)
     }
 
     // MARK: - Dictation flow (⌥⇧D)
@@ -3387,9 +3555,11 @@ private final class RecordingIndicatorOverlay: NSObject {
 
     private func startDictation() {
         guard currentDictationState() == .idle else { return }
+        typingGeneration &+= 1
         setDictationState(.starting)
         // Where the text should land — captured before anything can shift focus.
         dictationTargetApp = NSWorkspace.shared.frontmostApplication
+        dictationTargetElement = dictationTargetApp.flatMap { focusedElement(pid: $0.processIdentifier) }
         guard isSTTInstalled else {
             setDictationState(.idle)
             NSApp.activate(ignoringOtherApps: true)
@@ -3488,11 +3658,15 @@ private final class RecordingIndicatorOverlay: NSObject {
         audioConverter = converter
 
         let client = STTStreamClient()
+        lastPartialTranscript = ""
+        lastPartialWords = []
         // Identity guards: a late partial/final from an abandoned session
         // (fallback fired, or a new recording already started) is ignored.
         client.onPartial = { [weak self, weak client] p, words in
             DispatchQueue.main.async {
                 guard let self = self, self.sttClient === client else { return }
+                self.lastPartialTranscript = p
+                self.lastPartialWords = words
                 onPartial(p, words)
             }
         }
@@ -3500,6 +3674,12 @@ private final class RecordingIndicatorOverlay: NSObject {
             DispatchQueue.main.async {
                 guard let self = self, self.sttClient === client else { return }
                 onFinal(f, words)
+            }
+        }
+        client.onFailure = { [weak self, weak client] message in
+            DispatchQueue.main.async {
+                guard let self, self.sttClient === client else { return }
+                self.failStreamingSession(message)
             }
         }
         sttClient = client
@@ -3520,25 +3700,26 @@ private final class RecordingIndicatorOverlay: NSObject {
         }
 
         input.installTap(onBus: 0, bufferSize: 4096, format: hwFormat) { [weak self] buffer, _ in
-            guard let self = self, let conv = self.audioConverter else { return }
+            guard let self else { return }
             let cap = AVAudioFrameCount(
                 Double(buffer.frameLength) * Double(Self.sttSampleRate) / hwFormat.sampleRate) + 512
             guard let outBuf = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: cap) else { return }
             var fed = false
             var err: NSError?
-            conv.convert(to: outBuf, error: &err) { _, status in
+            converter.convert(to: outBuf, error: &err) { _, status in
                 if fed { status.pointee = .noDataNow; return nil }
                 fed = true; status.pointee = .haveData; return buffer
             }
             if let ch = outBuf.floatChannelData, outBuf.frameLength > 0 {
                 let samples = Array(UnsafeBufferPointer(start: ch[0], count: Int(outBuf.frameLength)))
-                self.sttClient?.send(samples: samples)
+                client.send(samples: samples)
                 var sumSquares: Float = 0
                 for sample in samples { sumSquares += sample * sample }
                 let rms = sqrt(sumSquares / Float(samples.count))
                 let decibels = 20 * log10(max(rms, 0.000_01))
                 let level = min(max((decibels + 55) / 45, 0), 1)
                 DispatchQueue.main.async { [weak self] in
+                    guard self?.sttClient === client else { return }
                     self?.updateRecordingLevel(CGFloat(level))
                 }
             }
@@ -3561,6 +3742,29 @@ private final class RecordingIndicatorOverlay: NSObject {
         setDictating(false)
         recordingOverlay.hide()
         dictationStopAt = CFAbsoluteTimeGetCurrent()
+    }
+
+    private func failStreamingSession(_ message: String) {
+        let state = currentDictationState()
+        if state == .recording || state == .cardRecording { stopEngine() }
+        cleanupDictation()
+        dictationGeneration &+= 1
+        if state == .cardRecording || state == .cardAwaitingFinal {
+            overlay.cancelCardDictation()
+            setDictationState(.reviewing)
+            // Preserve the existing review text; a flash would replace it.
+            showNote("Dictation interrupted", message + " Your previous review text is unchanged.")
+        } else if !lastPartialTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            setDictationState(.reviewing)
+            overlay.showReview(text: lastPartialTranscript, words: lastPartialWords,
+                               takeKey: false, notice: "Interrupted — review the partial transcript")
+        } else {
+            overlay.hide()
+            recordingOverlay.hide()
+            dictationTargetApp = nil
+            setDictationState(.idle)
+            showNote("Dictation interrupted", message)
+        }
     }
 
     private func beginRecording() {
@@ -3613,17 +3817,14 @@ private final class RecordingIndicatorOverlay: NSObject {
         // a newer session or a showing review card. The voxtral engine
         // decodes the whole utterance once more for the final, so its warm
         // timeout must absorb a long utterance's decode as well.
-        let warmTimeout: Double = config.sttEngine == "voxtral" ? 20 : 6
-        let timeout: Double = isSTTModelLoaded ? warmTimeout : 35
+        let warmTimeout: Double = config.sttEngine == "voxtral" ? 65 : 15
+        let timeout: Double = isSTTModelLoaded ? warmTimeout : 95
         let gen = dictationGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self = self,
                   self.dictationGeneration == gen,
                   self.currentDictationState() == .awaitingFinal else { return }
-            self.overlay.hide()
-            self.recordingOverlay.hide()
-            self.cleanupDictation()
-            self.setDictationState(.idle)
+            self.failStreamingSession("The local speech service timed out. Please try again.")
         }
     }
 
@@ -3733,6 +3934,8 @@ private final class RecordingIndicatorOverlay: NSObject {
             // target-aware delivery path as the review card, even when review
             // is disabled, so a late provider response cannot lose the text.
             let captured = dictationTargetApp
+            let capturedElement = dictationTargetElement
+            let generation = typingGeneration
             dictationTargetApp = nil
             overlay.hide()
             setDictationState(.idle)
@@ -3740,7 +3943,21 @@ private final class RecordingIndicatorOverlay: NSObject {
                 overlay.flash("Rewrite unavailable \u{2014} inserting original")
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.deliverTranscript(text, fallbackTarget: captured)
+                guard let self, self.typingGeneration == generation else { return }
+                // Immediate insertion has no review action authorizing
+                // redirection of a delayed result to another application.
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        == captured?.processIdentifier else {
+                    self.copyTranscriptFallback(text)
+                    return
+                }
+                if let capturedElement, let pid = captured?.processIdentifier {
+                    guard let current = self.focusedElement(pid: pid), CFEqual(current, capturedElement) else {
+                        self.copyTranscriptFallback(text)
+                        return
+                    }
+                }
+                self.deliverTranscript(text, fallbackTarget: captured, generation: generation)
             }
         }
     }
@@ -3751,13 +3968,14 @@ private final class RecordingIndicatorOverlay: NSObject {
         setDictationState(.idle)
         overlay.hide()
         let captured = dictationTargetApp
+        let generation = typingGeneration
         dictationTargetApp = nil
         guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else { return }
         // Give the window server a beat to route key focus back to the
         // frontmost app after the panel orders out, then deliver.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.deliverTranscript(text, fallbackTarget: captured)
+            self?.deliverTranscript(text, fallbackTarget: captured, generation: generation)
         }
     }
 
@@ -3790,15 +4008,13 @@ private final class RecordingIndicatorOverlay: NSObject {
 
         // Same lingering-session fallback as the main flow: on timeout the
         // provisional text is removed and the card stays up.
-        let timeout: Double = isSTTModelLoaded ? 6 : 35
+        let timeout: Double = isSTTModelLoaded ? (config.sttEngine == "voxtral" ? 65 : 15) : 95
         let gen = dictationGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self = self,
                   self.dictationGeneration == gen,
                   self.currentDictationState() == .cardAwaitingFinal else { return }
-            self.cleanupDictation()
-            self.overlay.cancelCardDictation()
-            self.setDictationState(.reviewing)
+            self.failStreamingSession("The local speech service timed out. Please try again.")
         }
     }
 
@@ -3823,7 +4039,8 @@ private final class RecordingIndicatorOverlay: NSObject {
     // when no safe paste target exists, fall back to a plain clipboard copy
     // so the transcript is never lost.
     private func deliverTranscript(_ text: String, fallbackTarget: NSRunningApplication?,
-                                   attempts: Int = 0) {
+                                   generation: Int, attempts: Int = 0) {
+        guard generation == typingGeneration else { return }
         let myPid = ProcessInfo.processInfo.processIdentifier
         if let front = NSWorkspace.shared.frontmostApplication,
            front.processIdentifier != pid_t(myPid) {
@@ -3855,7 +4072,7 @@ private final class RecordingIndicatorOverlay: NSObject {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             self?.deliverTranscript(text, fallbackTarget: fallbackTarget,
-                                    attempts: attempts + 1)
+                                    generation: generation, attempts: attempts + 1)
         }
     }
 
@@ -3864,17 +4081,21 @@ private final class RecordingIndicatorOverlay: NSObject {
         let value: String
     }
 
-    // Only text controls with an observable value are eligible for clipboard
-    // restoration. AX-opaque editors still receive the paste, but keep the
-    // transcript on the clipboard because insertion cannot be verified there.
-    private func editablePasteTarget(pid: pid_t) -> EditablePasteTarget? {
+    private func focusedElement(pid: pid_t) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.3)
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString,
                                              &focused) == .success,
-              let element = focused else { return nil }
-        let target = element as! AXUIElement
+              let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
+        return (focused as! AXUIElement)
+    }
+
+    // Only text controls with an observable value are eligible for clipboard
+    // restoration. AX-opaque editors still receive the paste, but keep the
+    // transcript on the clipboard because insertion cannot be verified there.
+    private func editablePasteTarget(pid: pid_t) -> EditablePasteTarget? {
+        guard let target = focusedElement(pid: pid) else { return nil }
         AXUIElementSetMessagingTimeout(target, 0.3)
 
         var roleValue: CFTypeRef?
@@ -3946,12 +4167,13 @@ private final class RecordingIndicatorOverlay: NSObject {
         let wpm = min(max(config.dictationTypingWPM, 1), 2000)
         let interval = 60.0 / (Double(wpm) * 5.0)
         typeNextCharacter(characters, at: 0, originalText: text,
-                          targetPid: targetPid, source: source,
+                          targetPid: targetPid, targetElement: focusedElement(pid: targetPid), source: source,
                           interval: interval, generation: generation)
     }
 
     private func typeNextCharacter(_ characters: [Character], at index: Int,
                                    originalText: String, targetPid: pid_t,
+                                   targetElement: AXUIElement?,
                                    source: CGEventSource, interval: TimeInterval,
                                    generation: Int) {
         guard generation == typingGeneration else { return }
@@ -3960,6 +4182,12 @@ private final class RecordingIndicatorOverlay: NSObject {
               !IsSecureEventInputEnabled() else {
             copyTranscriptFallback(originalText)
             return
+        }
+        if let targetElement {
+            guard let current = focusedElement(pid: targetPid), CFEqual(current, targetElement) else {
+                copyTranscriptFallback(originalText)
+                return
+            }
         }
 
         let utf16 = Array(String(characters[index]).utf16)
@@ -3980,7 +4208,7 @@ private final class RecordingIndicatorOverlay: NSObject {
         guard next < characters.count else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
             self?.typeNextCharacter(characters, at: next, originalText: originalText,
-                                    targetPid: targetPid, source: source,
+                                    targetPid: targetPid, targetElement: targetElement, source: source,
                                     interval: interval, generation: generation)
         }
     }
@@ -4059,9 +4287,13 @@ private final class RecordingIndicatorOverlay: NSObject {
     private func stopSpeaking() {
         killCurrentProcess()
         speakLock.lock()
-        isSpeakingFlag = false
+        let stoppedGeneration = speakGeneration
         speakLock.unlock()
         DispatchQueue.main.async {
+            self.speakLock.lock()
+            let stillStopped = self.speakGeneration == stoppedGeneration && !self.isSpeakingFlag
+            self.speakLock.unlock()
+            guard stillStopped else { return }
             self.respeakTimer?.invalidate()
             self.respeakTimer = nil
             self.setSpeaking(false)
@@ -4146,11 +4378,18 @@ private final class RecordingIndicatorOverlay: NSObject {
     }
 
     func respeak() {
-        let remainingText = calculateRemainingText()
+        guard let remainingText = calculateRemainingText() else { stopSpeaking(); return }
         killCurrentProcess()
-        // Brief delay to let the old process clean up
-        Thread.sleep(forTimeInterval: 0.05)
-        runSpeak(withText: remainingText)
+        speakLock.lock()
+        let generation = speakGeneration
+        speakLock.unlock()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            self.speakLock.lock()
+            let stillCurrent = self.speakGeneration == generation
+            self.speakLock.unlock()
+            guard stillCurrent else { return }
+            self.runSpeak(withText: remainingText)
+        }
     }
 
     func scheduleRespeak() {
@@ -4667,20 +4906,40 @@ private final class RecordingIndicatorOverlay: NSObject {
     /// and rebuild the menu.
     private func runInstallLocal(desiredBackend: String, withVoxtral: Bool = false,
                                  completion: @escaping (Bool) -> Void) {
+        guard !localInstallInProgress else {
+            showNote("Installation already running", "Please wait for the current speech-model installation to finish.")
+            completion(false)
+            return
+        }
+        localInstallInProgress = true
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/bin/bash")
             task.arguments = withVoxtral ? [installLocalPath, "--with-voxtral"]
                                          : [installLocalPath]
-            task.standardOutput = FileHandle.nullDevice
-            task.standardError  = FileHandle.nullDevice
+            let logPath = (ogmaDataDir as NSString).appendingPathComponent("install.log")
+            let fm = FileManager.default
+            try? fm.createDirectory(atPath: ogmaDataDir, withIntermediateDirectories: true,
+                                    attributes: [.posixPermissions: 0o700])
+            if !fm.fileExists(atPath: logPath) {
+                fm.createFile(atPath: logPath, contents: nil, attributes: [.posixPermissions: 0o600])
+            }
+            let log = FileHandle(forWritingAtPath: logPath)
+            _ = try? log?.seekToEnd()
+            task.standardOutput = log ?? FileHandle.nullDevice
+            task.standardError = log ?? FileHandle.nullDevice
+            defer { try? log?.close() }
             do { try task.run() } catch {
-                DispatchQueue.main.async { completion(false) }
+                DispatchQueue.main.async {
+                    self.localInstallInProgress = false
+                    completion(false)
+                }
                 return
             }
             task.waitUntilExit()
             let success = task.terminationStatus == 0
             DispatchQueue.main.async { [self] in
+                localInstallInProgress = false
                 if success {
                     config = Config.load()
                     config.ttsBackend = desiredBackend
@@ -4700,7 +4959,7 @@ private final class RecordingIndicatorOverlay: NSObject {
             a.informativeText = "Read-aloud (Kokoro) and dictation (Parakeet) are ready.\n\n⌥⇧/ speaks your selection · ⌥⇧D types what you say."
         } else {
             a.messageText = "Installation Failed"
-            a.informativeText = "Could not install local TTS.\n\nAn internet connection is required for the first install.\nPlease check your connection and try again."
+            a.informativeText = "Could not finish installing the local speech engine.\n\nCheck your connection and try again. Details are saved in ~/.local/share/ogma/install.log."
             a.alertStyle = .warning
         }
         a.addButton(withTitle: "OK")
@@ -4747,9 +5006,10 @@ private final class RecordingIndicatorOverlay: NSObject {
         for name in bundledNames {
             let src = (scriptsDir as NSString).appendingPathComponent(name)
             let dst = (binDir as NSString).appendingPathComponent(name)
-            try? fm.removeItem(atPath: dst)
             do {
-                try fm.copyItem(atPath: src, toPath: dst)
+                // Keep the working helper if replacement fails or is interrupted.
+                try Data(contentsOf: URL(fileURLWithPath: src))
+                    .write(to: URL(fileURLWithPath: dst), options: .atomic)
                 try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst)
             } catch {
                 NSLog("Ogma: failed to install \(name): \(error.localizedDescription)")
@@ -5330,10 +5590,7 @@ private final class RecordingIndicatorOverlay: NSObject {
     // Stop whichever daemon is running (app- or speak.sh-started) via its PID
     // file, so the model is released immediately.
     private func unloadModel() {
-        if let pidStr = try? String(contentsOfFile: ttsPidPath, encoding: .utf8),
-           let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            kill(pid, SIGTERM)
-        }
+        terminateDaemon(pidPath: ttsPidPath, scriptPath: ttsServerPath)
         stopTTSDaemon()
     }
 
@@ -5963,6 +6220,10 @@ private final class RecordingIndicatorOverlay: NSObject {
 }
 
 // MARK: - Entry point
+
+// A cancelled speech subprocess can close stdin while a large selection is
+// still being written. Handle EPIPE as a write error instead of exiting.
+signal(SIGPIPE, SIG_IGN)
 
 if CommandLine.arguments.contains("--self-test-pasteboard-snapshot") {
     exit(runPasteboardSnapshotSelfTest() ? EXIT_SUCCESS : EXIT_FAILURE)

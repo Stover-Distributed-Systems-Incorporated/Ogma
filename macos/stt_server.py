@@ -79,7 +79,30 @@ if ENGINE not in ("parakeet", "voxtral"):
 # of leading context than when speech starts at the very edge of the buffer —
 # which is exactly what happens on a cold start, where you tend to start
 # talking the instant you press the hotkey.  Set STT_LEAD_SILENCE=0 to disable.
-LEAD_SILENCE_SEC = float(os.environ.get("STT_LEAD_SILENCE", "0.3"))
+try:
+    LEAD_SILENCE_SEC = float(os.environ.get("STT_LEAD_SILENCE", "0.3"))
+    if not 0 <= LEAD_SILENCE_SEC <= 2:
+        LEAD_SILENCE_SEC = 0.3
+except ValueError:
+    LEAD_SILENCE_SEC = 0.3
+
+MAX_FRAME_BYTES = 1024 * 1024
+activity_lock = threading.Lock()
+active_requests = 0
+last_activity = time.monotonic()
+state_write_lock = threading.Lock()
+
+
+def validate_frame_size(size):
+    if size > MAX_FRAME_BYTES or size % 4:
+        raise ValueError("Invalid audio frame length")
+
+
+def stream_sample_rate(request):
+    rate = int(request.get("sample_rate", 16000))
+    if not 8000 <= rate <= 192000:
+        raise ValueError("Unsupported audio sample rate")
+    return rate
 
 # Idle timeout: the model is released after this long with no requests.
 # Resolved fresh on each check (see effective_timeout) so the menu bar's
@@ -97,7 +120,7 @@ def effective_timeout():
                    os.environ.get("STT_IDLE_TIMEOUT")):
         try:
             v = int(source)
-            if v >= MIN_IDLE_TIMEOUT:
+            if MIN_IDLE_TIMEOUT <= v <= 86400:
                 return v
         except (TypeError, ValueError):
             continue
@@ -133,11 +156,12 @@ def write_state():
     """Publish daemon state for the menu bar (best-effort, atomic write)."""
     try:
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"idle_timeout": effective_timeout(),
-                       "last_request": last_request_time,
-                       "engine": ENGINE if voxtral is not None else "parakeet"}, f)
-        os.replace(tmp, STATE_FILE)
+        with state_write_lock:
+            with open(tmp, "w") as f:
+                json.dump({"idle_timeout": effective_timeout(),
+                           "last_request": last_request_time,
+                           "engine": ENGINE if voxtral is not None else "parakeet"}, f)
+            os.replace(tmp, STATE_FILE)
     except OSError:
         pass
 
@@ -632,7 +656,7 @@ def handle_stream(conn, request, initial=b""):
     import numpy as np
     import mlx.core as mx
 
-    sr = int(request.get("sample_rate", 16000))
+    sr = stream_sample_rate(request)
     target_sr = model.preprocessor_config.sample_rate
     log(f"stream start (sr={sr})")
 
@@ -706,14 +730,17 @@ def handle_stream(conn, request, initial=b""):
             while not shutdown_event.is_set():
                 header = read_exact(4)
                 if header is None:
-                    break
+                    return   # disconnected/cancelled: do not finalize
                 (n,) = struct.unpack(">I", header)
+                validate_frame_size(n)
                 if n == 0:
                     break
                 payload = read_exact(n)
                 if payload is None:
-                    break
+                    return
                 samples = np.frombuffer(payload, dtype="<f4")
+                if not np.isfinite(samples).all():
+                    raise ValueError("Non-finite audio samples")
                 if sr != target_sr:
                     import librosa
                     samples = librosa.resample(
@@ -754,7 +781,7 @@ def handle_stream_voxtral(conn, request, initial=b""):
     global last_request_time
     import numpy as np
 
-    sr = int(request.get("sample_rate", 16000))
+    sr = stream_sample_rate(request)
     target_sr = 16000
     want_partials = request.get("want_partials", True) is not False
     delay_ms = 480 if want_partials else 2400
@@ -787,6 +814,7 @@ def handle_stream_voxtral(conn, request, initial=b""):
             if len(buf) < 4:
                 return
             (n,) = struct.unpack(">I", bytes(buf[:4]))
+            validate_frame_size(n)
             if n == 0:
                 del buf[:4]
                 ended = True
@@ -796,6 +824,8 @@ def handle_stream_voxtral(conn, request, initial=b""):
             payload = bytes(buf[4:4 + n])
             del buf[:4 + n]
             samples = np.frombuffer(payload, dtype="<f4")
+            if not np.isfinite(samples).all():
+                raise ValueError("Non-finite audio samples")
             if sr != target_sr:
                 import librosa
                 samples = librosa.resample(
@@ -865,8 +895,13 @@ def handle_stream_voxtral(conn, request, initial=b""):
 
 def handle_client(conn):
     """Handle one connection: streaming (mode:stream) or one-shot transcription."""
-    global last_request_time
-    last_request_time = time.time()
+    global last_request_time, last_activity, active_requests
+    with activity_lock:
+        if shutdown_event.is_set():
+            conn.close()
+            return
+        active_requests += 1
+        last_request_time = time.time()
 
     try:
         data = b""
@@ -876,6 +911,8 @@ def handle_client(conn):
             if not chunk:
                 break
             data += chunk
+            if len(data.partition(b"\n")[0]) > 65536:
+                raise ValueError("STT request header exceeds 64 KiB")
 
         if not data.strip():
             return
@@ -943,6 +980,11 @@ def handle_client(conn):
 
         gc.collect()
         mx.metal.clear_cache()
+        with activity_lock:
+            active_requests -= 1
+            last_activity = time.monotonic()
+            last_request_time = time.time()
+        write_state()
 
 
 # ── Idle watchdog ────────────────────────────────────────────────────
@@ -954,8 +996,14 @@ def idle_watchdog():
     menu countdown stays accurate."""
     while not shutdown_event.is_set():
         timeout = effective_timeout()
-        remaining = timeout - (time.time() - last_request_time)
-        if remaining <= 0:
+        with activity_lock:
+            remaining = timeout - (time.monotonic() - last_activity)
+            should_stop = active_requests == 0 and remaining <= 0
+            if should_stop:
+                shutdown_event.set()
+            elif active_requests:
+                remaining = timeout
+        if should_stop:
             log(f"idle for {timeout}s, shutting down")
             do_shutdown()
             return
@@ -1012,11 +1060,13 @@ def handle_signal(signum, _frame):
 
 
 def main():
-    global server_socket, managed_mode, last_request_time
+    global server_socket, managed_mode, last_request_time, last_activity
 
     managed_mode = "--managed" in sys.argv[1:]
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.umask(0o077)
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
 
     # Acquire exclusive lock — guarantees at most one daemon runs.
     lock_fd = open(LOCK_FILE, "w")
@@ -1047,6 +1097,7 @@ def main():
 
     # Model load can take seconds — reset the idle clock and publish state.
     last_request_time = time.time()
+    last_activity = time.monotonic()
     write_state()
 
     # Idle watchdog runs in every mode; managed mode also runs the parent
@@ -1058,6 +1109,7 @@ def main():
     # Create socket — this signals readiness (clients poll for the socket).
     server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_socket.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
     server_socket.listen(2)
     server_socket.settimeout(5)
 

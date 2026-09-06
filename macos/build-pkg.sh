@@ -185,7 +185,11 @@ pkgbuild \
     --scripts "$STAGE/pkgscripts" \
     "$STAGE/ogma-component.pkg" > /dev/null
 
-cp "$SCRIPT_DIR/LICENSE" "$STAGE/pkgres/LICENSE.txt"
+LICENSE_FILE="$SCRIPT_DIR/LICENSE"
+if [ ! -f "$LICENSE_FILE" ]; then
+    LICENSE_FILE="$SCRIPT_DIR/../LICENSE"
+fi
+cp "$LICENSE_FILE" "$STAGE/pkgres/LICENSE.txt"
 
 cat > "$STAGE/distribution.xml" << DIST_XML
 <?xml version="1.0" encoding="utf-8"?>
