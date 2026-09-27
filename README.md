@@ -7,7 +7,7 @@
 Ogma is a free, open-source voice toolkit for macOS: local dictation,
 text-to-speech, and paced reading from a native menu-bar app.
 
-Current macOS version: **2.4.3**. Requires macOS 13 or later; local speech models
+Current macOS version: **2.4.4**. Requires macOS 13 or later; local speech models
 require Apple Silicon. Speech recognition stays on your Mac. Optional cloud
 read-aloud and transcript rewriting are configurable.
 

@@ -27,6 +27,11 @@ require(savedSettings.contains("FILTER_FILLERS=\"false\""), "helper settings pre
 let permissions = try FileManager.default.attributesOfItem(atPath: settingsPath)[.posixPermissions] as! NSNumber
 require(permissions.intValue == 0o600, "configuration permissions")
 require(runIntentRewriteSelfTest(), "existing provider request/response regressions")
+let dictionaryPath = testDirectory + "/dictionary.txt"
+try "# Comment\nXanthippe\nCodex\nXANTHIPPE\nTwo words\nignore!\n".write(
+    toFile: dictionaryPath, atomically: true, encoding: .utf8)
+require(IntentRewriteClient.dictionaryWords(at: dictionaryPath) == ["Xanthippe", "Codex"],
+        "dictionary hints reject comments, duplicates, and malformed entries")
 let fencedLines = Data(#"{"choices":[{"message":{"content":"```\nHello.\nWorld.\n```"}}]}"#.utf8)
 let decoded = try IntentRewriteClient.rewrittenText(from: fencedLines, provider: .compatible,
                                                    original: "Hello. World.")
