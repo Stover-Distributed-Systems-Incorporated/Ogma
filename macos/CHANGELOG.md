@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.4.4
+
+- Send personal dictionary words to the configured Intent Rewrite provider as spelling hints, so they can help with Voxtral dictation and immediate insertion as well as Parakeet review. Ignore comments, duplicates, and malformed entries in rewrite hints.
+- Clarify how dictionary suggestions and rewrite hints work, including that remote rewrite providers receive the dictionary words with the transcript.
+
 ## v2.4.3
 
 - Prevent large read-aloud selections from blocking before the speech process starts; protect newer playback from stale completions and delayed restarts.
