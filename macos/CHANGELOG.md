@@ -4,6 +4,7 @@
 
 - Send personal dictionary words to the configured Intent Rewrite provider as spelling hints, so they can help with Voxtral dictation and immediate insertion as well as Parakeet review. Ignore comments, duplicates, and malformed entries in rewrite hints.
 - Clarify how dictionary suggestions and rewrite hints work, including that remote rewrite providers receive the dictionary words with the transcript.
+- Include the full macOS source tree in release archives and reject incomplete source zips before upload.
 
 ## v2.4.3
 

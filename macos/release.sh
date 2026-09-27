@@ -83,7 +83,11 @@ ASSET_NAME="ogma-${TAG}.zip"
 ZIP="$_TMPDIR/$ASSET_NAME"
 STABLE_ZIP="$_TMPDIR/ogma.zip"
 # Package only the macOS product now that the repository is multi-platform.
-git -C "$SCRIPT_DIR" archive --format=zip --prefix=ogma/ HEAD:macos -o "$ZIP"
+git -C "$SCRIPT_DIR/.." archive --format=zip --prefix=ogma/ HEAD:macos -o "$ZIP"
+if ! unzip -Z -1 "$ZIP" | grep -Fx "ogma/Ogma.swift" >/dev/null; then
+    echo "Source archive is missing Ogma.swift; refusing to publish." >&2
+    exit 1
+fi
 # Include the repository license in the standalone macOS source download.
 mkdir -p "$_TMPDIR/source/ogma"
 git -C "$SCRIPT_DIR/.." archive --format=tar HEAD LICENSE | tar -xf - -C "$_TMPDIR/source/ogma"
